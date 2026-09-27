@@ -1,148 +1,90 @@
-# Scribetray UI refresh — plan and assets
+# Scribetray — recovery and send plan (v0.4)
 
-This folder is a design hand-off. It contains no application code changes. An implementer should be able to build it from this file, the generated assets in `out/`, and the reference drawing code in `overlay-prototype.html`.
+This replaces the v0.3 UI refresh plan, which has shipped in `82a9f7a`. Three small leftovers from that plan are listed at the end. Everything here was decided with the user; implement it as written.
 
-| File | Purpose |
+## 1. Tray icon: caret + voice (assets done)
+
+The tray icon is now a text caret in the taskbar color with a three-bar voice wave. The wave color carries the state, so there is no badge. The icon deliberately contains no microphone, so it doesn't compete with the Windows privacy mic indicator.
+
+| State | Wave |
 |---|---|
-| `tools/render_assets.py` | Reproducible generator: `uv run design/ui-refresh/tools/render_assets.py` |
-| `out/scribetray.ico` | New app icon (16–256 px), replaces `assets/scribetray.ico` |
-| `out/tray/tray-{idle,recording,working,error,off}-{dark,light}.ico` | Tray icons, 16/20/24/32/40/48 px each |
-| `out/tray-states-preview.png` | Contact sheet of all tray states on dark and light taskbars |
-| `out/overlay-recording.gif`, `out/overlay-working.gif`, `out/overlay-states.png` | Overlay previews (3× scale) |
-| `overlay-prototype.html` | Live reference: states, placement, DPI scale, timer modes, real microphone input |
+| idle | coral `#F0564A` |
+| recording | blue `#3B8BFF` |
+| working | amber `#F5A524` |
+| error | red × replaces the wave |
+| off | whole glyph at 45% opacity |
 
-## 1. Review of the current UI
+The icons are already regenerated in `design/ui-refresh/out/tray/` with the same file names and resource IDs, and `build.rs` embeds them from there. **Implementation: rebuild only.** The error rule is unchanged: it clears on the next successful dictation or when History is opened, whichever comes first. The tray icon is a nice-to-have; do not spend effort beyond this.
 
-1. **Tray icon never changes.** `create_ui_state` loads resource 1 once and `Shell_NotifyIconW(NIM_MODIFY)` is only used for balloons. The icon has a red dot above a white stand, so it reads as a traffic light that is always red. It carries no state.
-2. **Only one icon size.** `assets/scribetray.ico` contains a single 64×64 image. `LoadIconW` returns the 32 px system size, and the shell then scales it to 16/20/24 px, so it looks blurry at every DPI.
-3. **The tray tooltip is invisible.** The code sets `NOTIFYICON_VERSION_4` without `NIF_SHOWTIP`. With version 4 the shell shows the standard tooltip only when that flag is set.
-4. **Overlay is large, opaque, and ignores DPI.** The overlay is 152×44 *physical* px in a PerMonitorV2 process, drawn with GDI into an `LWA_COLORKEY` window. Color keying cannot antialias the rounded corners or fade. The system bitmap font is used for text, and the pill sits 10 px below the caret, where it covers UI such as "Full access" in the Codex composer.
-5. **The recording overlay shows time, not signal.** A blinking dot and mm:ss cannot tell you whether the microphone hears you, which is the question you have while you talk. A live level meter answers it.
-6. **The menu is flat and mixes kinds of items.** Eleven top-level entries mix actions, persistent preferences, and mutually exclusive modes, all with the same checkmark style. It also includes a grayed sentence explaining Type mode. Hotkeys are missing from the labels, and the default action (left-click) isn't marked in the menu.
+Preview: `out/tray-states-preview.png`. Generator: `tools/render_assets.py` (`tray_icon`).
 
-## 2. Tray icon
+## 2. History as a recovery list
 
-The idle icon is a **monochrome microphone glyph**, like Windows system tray icons: white on a dark taskbar, near-black on a light one. State is shown only by a **badge** in the lower-right corner, with a 1.25 px transparent gap cut into the glyph. Nothing flashes.
+History exists to recover dictations that did not reach their field. The menu should answer one question: *which one do I need?*
 
-| State | Badge | When |
+Row format: the transcript preview, then `\t`, then the duration as `MMmSSs`. The `\t` right-aligns the duration in the shortcut column. Remove the date completely, including `history_timestamp_label`; list order already means "newest first".
+
+```
+Ciao, potresti effettuare una revisione…      01m41s
+Sure, my dear. How are you?                   00m03s
+⚠ Allora, ti do un po' di feedback…           01m44s
+✕ Transcription failed — click to retry       00m08s
+Transcribing…                                 00m12s   (grayed)
+```
+
+- **⚠ = not delivered.** The transcript exists but was only copied to the clipboard: insertion failed, the focus guard rejected the target, or delivery was `Delivery::Clipboard`. Clicking the row copies it, the same as unmarked rows.
+- **✕ = transcription failed.** Clicking retries (existing `HistoryRetry`).
+- **Hidden:** succeeded recordings with an empty or whitespace transcript (today they show as "No transcript"). They still count toward the 20 stored on disk, and the menu shows the 10 newest visible rows.
+- **Pending** rows are grayed with no action.
+- Duration comes from `duration_seconds`. The cap is `max_seconds` = 600, so `MMmSSs` always fits. Format with `format!("{:02}m{:02}s", s / 60, s % 60)`.
+
+Data change in `history.rs`: add `delivered: Option<bool>` to `Recording` with `#[serde(default, skip_serializing_if = "Option::is_none")]`. `None` (older records, or not yet delivered) shows no marker. Add `History::mark_delivered(id, bool)`. In `main.rs`, call it with `true` after a successful insertion. Call it with `false` in both clipboard fallbacks: the `Err` branch of paste/type delivery, and `Delivery::Clipboard | None`.
+
+Accept: a dictation whose target window lost focus shows ⚠ in History, while a normal one shows no marker. Silence-only recordings don't appear, and no date appears anywhere in the menu.
+
+## 3. Left click = recover the last dictation
+
+Left click (`WM_LBUTTONUP` / `NIN_SELECT`, which currently open the menu) acts on the **newest visible history row**, using the same visibility rule as §2:
+
+| Newest row | Action | Balloon |
 |---|---|---|
-| idle | none | Ready |
-| recording | solid red dot `#F04438` | Capturing audio |
-| working | solid amber dot `#F5A524` | Upload / waiting for Scribe |
-| error | red dot with white × | Last attempt failed; clears on the next successful dictation or when History is opened, whichever comes first |
-| off | glyph with a slash | No API key, no input device, or hotkey registration failed |
+| has a transcript | copy to clipboard | `Copied: "Ciao, potresti effettuare…" · 01m41s` |
+| failed | retry transcription | `Retrying 00m08s…` (the normal completion flow then delivers to clipboard) |
+| pending | nothing | `Still transcribing…` |
+| no history | nothing | `Nothing to recover yet` |
 
-Implementation notes:
+Right click keeps the full menu. Copying from a left click counts as "History opened" for the error rule in §1. Extend the idle tooltip to `Scribetray — Ready (Win+Alt+V) · click: copy last dictation`.
 
-- Embed the 10 icons as resources (`winresource` supports `set_icon_with_id`) or `include_bytes!` them and use `CreateIconFromResourceEx`. Load each with `LoadIconMetric(hinst, id, LIM_SMALL)`, which picks the right size for the current DPI. Reload on `WM_DPICHANGED`/`WM_SETTINGCHANGE`.
-- Pick the theme from `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\SystemUsesLightTheme` (the taskbar value, which differs from `AppsUseLightTheme`). Re-read it on `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"`.
-- Swap icons with `NIM_MODIFY` + `NIF_ICON` whenever the `AnchorStatus`-equivalent app state changes.
-- Tooltip: add `NIF_SHOWTIP` and update `szTip` with the state:
-  - `Scribetray — Ready (Win+Alt+V)`
-  - `Scribetray — Recording 00:35 · Esc to cancel` (update once per second while recording)
-  - `Scribetray — Transcribing…`
-  - `Scribetray — Last dictation failed · click History to retry`
-  - `Scribetray — Set an API key in settings`
+Why left click doesn't start recording: clicking the tray makes the taskbar the foreground window, so `capture_target` would snapshot the taskbar rather than the text field.
 
-The **app icon** (`out/scribetray.ico`) is a separate, colored brand tile: a warm coral-to-crimson gradient with a white mic. At 48 px and above, two waveform bars appear on each side. It is used for the exe, the Start menu, and Settings. It should never appear in the tray.
+Accept: after a dictation lands in the wrong place, one left click puts it on the clipboard with a confirming balloon.
 
-## 3. Caret overlay: a small live waveform
+## 4. Enter stops and sends; remove the submit hotkey
 
-Replace the 152×44 card with a **58×22 DIP pill**, roughly the height of a line of text. `overlay-prototype.html` is the reference implementation; port its `frame()` function directly.
+The key that ends a recording decides what happens:
 
-Geometry (DIPs, multiply by the scale of the caret's monitor):
-
-- Pill 58×22, radius 11, fill `rgba(22,24,29,0.94)`, 1 px inner border `rgba(255,255,255,0.13)`. Soft shadow of 8 px blur, 2 px y-offset at 35% black, so the window is the pill plus 8 px padding on each side.
-- Status dot at x = 11, r = 3. When recording it is red and breathes between 55% and 100% opacity over a 1.6 s period.
-- Waveform: 7 bars, 2 px wide, 4 px pitch, starting at x = 21, with round caps and color `#F0F2F5`. Bar height = 2 + level × 12 (min 2, max 14), centered vertically.
-- Bars scroll right to left: every 50 ms the newest level is pushed on the right. On screen each bar eases toward its target with `shown += (target - shown) * 0.45` per 33 ms frame. The bars look alive only while you actually speak; flat dots mean silence or a dead mic, which is useful feedback.
-
-States:
-
-| State | Visual |
+| While recording | Result |
 |---|---|
-| recording | red breathing dot + scrolling waveform |
-| recording, push-to-talk | same, but the dot is a hollow red ring (1.5 px stroke) so releasing the key is understood to stop; low priority |
-| recording, ≤ 60 s before `max_seconds` | pill widens to 90 DIP; amber countdown `0:42` right-aligned, 11 px Segoe UI Variable Semibold |
-| working | amber dot + three dots in a travelling wave (0.9 s period, 3 px amplitude) |
-| done | collapses to a 22×22 circle with a green check; holds 0.7 s, fades 0.2 s |
-| error | 22×22 circle with a red ×; holds 2 s, fades 0.2 s; details stay in the balloon and History |
+| Win+Alt+V (toggle hotkey) | stop, insert (plus Enter only if the Auto-Enter setting is on) |
+| **Enter** | stop, insert, then press Enter once (same as today's `submit_on_complete = true`) |
+| Esc | cancel |
 
-Entry animation: 120 ms fade in, scaling from 0.92 to 1.
+- Register `VK_RETURN` with no modifiers in `set_recording(true)`, next to the existing Escape registration, and unregister it in the same places Esc is unregistered. A registration failure only logs a warning; recording continues without Enter-to-send.
+- The Enter hotkey maps to the existing submit path in `main.rs` (`submit_after_transcription`), so realtime and batch behave the same. In push-to-talk mode Enter works too: pressing it while holding the combo stops and sends.
+- Before inserting the text and before the synthetic Enter, wait until the physical Enter key is released (`GetAsyncKeyState(VK_RETURN)`). This goes next to the existing wait for Win/Alt/Shift release, and it prevents a double send.
+- **Remove** the submit hotkey entirely: `hotkey_submit` in `config.rs` and its default `Win+Alt+Shift+V`, `HotkeyPurpose::SubmitRecording` and its registration and collision check, `UiSettings::submit_hotkey`, and both "Record and send" menu items. Make sure old config files that still contain `hotkey_submit` load without error (serde ignores unknown keys unless `deny_unknown_fields` is set).
+- No menu entry for this. It is documented behavior: README, plus the recording tooltip `Recording 00:35 · Enter to send · Esc to cancel`.
 
-A new config key sets the timer mode: `overlay_timer = "near_limit" | "always" | "never"`, default `near_limit`. Elapsed time is always available in the tray tooltip.
+Accept: in the Codex composer, Win+Alt+V, speaking, then Enter inserts the text and submits once. An Enter pressed while idle is never intercepted.
 
-Placement: add `overlay_position = "above" | "right" | "below"`, default `above`. For `above`, place the pill 8 DIP above the caret top, with its left edge 4 DIP left of the caret. Flip to below when there is no room, then clamp to the monitor's **work area** (`MonitorFromRect` + `GetMonitorInfoW`), not the virtual screen. The fallback chain is unchanged: when the caret cannot be found, use the mouse position.
+## 5. Leftovers from v0.3 (low priority)
 
-Rendering:
+1. Overlay countdown: when ≤ 60 s remain before `max_seconds`, widen the pill to 90 DIP and show an amber `0:42`. The prototype has the reference drawing (`overlay-prototype.html`, "Recording, 0:42 left").
+2. Push-to-talk: a hollow red ring instead of the solid dot in the overlay. Push-to-talk is lightly used, so this goes last.
 
-- Replace `LWA_COLORKEY` + GDI with **`UpdateLayeredWindow(ULW_ALPHA)`** from a 32-bit premultiplied BGRA `CreateDIBSection`. Remove the `SetLayeredWindowAttributes` call; the two modes are mutually exclusive.
-- Draw with **`tiny-skia`** (pure Rust, antialiased paths, premultiplied RGBA output; swap R/B when copying into the DIB). For the countdown digits, rasterize with `ab_glyph` from `C:\Windows\Fonts\SegUIVar.ttf` (fall back to `segoeui.ttf`). Direct2D would also work but is more COM for little gain here.
-- Animation timer: 33 ms `SetTimer` only while the overlay is visible. Kill it on hide. Keep the existing 250 ms caret follow.
-- DPI: `GetDpiForMonitor(MonitorFromRect(caret))`, scale = dpi / 96. Re-rasterize when the scale changes.
+Dropped: the `overlay_timer` / `overlay_position` config keys. The fixed defaults are fine.
 
-Level plumbing from `audio.rs`:
+## Order
 
-- In the cpal input callback, accumulate the sum of squares of the mono f32 samples. About every 20 ms, compute `db = 20·log10(rms + 1e-9)`, `target = clamp((db + 52) / 40, 0, 1)`, and update an envelope: `env += (target - env) * (target > env ? 0.6 : 0.15)`.
-- Store the envelope as `f32::to_bits` in an `Arc<AtomicU32>` owned by the recorder. Expose `Recorder::level_meter() -> LevelMeter` (a cheap clone of the Arc).
-- `main.rs` passes the meter to the UI with a new `UiCommand::SetLevelMeter(Option<LevelMeter>)` when recording starts and `None` when it stops. The overlay timer samples it every 50 ms. There are no channels and no per-sample cross-thread traffic. The realtime and batch paths both use it.
-- The -52 dBFS floor and 40 dB range match a typical headset. If quiet mics look flat, expose `meter_floor_db` in config rather than adding AGC.
-
-## 4. Tray menu
-
-Proposed structure (`t` right-aligns the shortcut text; **bold** = `SetMenuDefaultItem`, which matches left-click):
-
-```
-**Start recording\tWin+Alt+V**          (Stop recording\tWin+Alt+V / Esc while recording)
-Record and send\tWin+Alt+Shift+V
-───────────────
-Microphone                       ▸  ● System default / ○ device… (radio)
-Language                         ▸  ● Auto / ○ Italiano / ○ English (radio)
-History                          ▸  14:32  Ciao, potresti effettuare una re…   (click = copy)
-                                     ⚠ 14:05  Failed — click to retry
-                                     ─────
-                                     Open history folder
-───────────────
-Recording                        ▸  ● Toggle (press again to stop) / ○ Push-to-talk (radio)
-                                     ☑ Realtime transcription
-                                     ☑ Sound cues
-Insert                           ▸  ● Type keystrokes / ○ Paste via clipboard (radio)
-                                     ☑ Add 🎙️ prefix
-                                     ☐ Press Enter after inserting
-───────────────
-Change hotkey…
-Open settings file
-☑ Start with Windows
-───────────────
-Quit Scribetray
-```
-
-Rationale and Win32 details:
-
-- Mutually exclusive choices (Microphone, Language, Toggle/Push-to-talk, Type/Paste) get radio bullets via `MFT_RADIOCHECK` (`InsertMenuItemW` with `MENUITEMINFOW`) or `CheckMenuRadioItem`. Independent options keep checkmarks. This separates "pick one" from "turn on".
-- Delete the grayed explanatory sentence. The label "Type keystrokes" says what it does; put the longer explanation in the README.
-- Group the preferences you rarely change under **Recording** and **Insert**. The top level then holds what you use daily: actions, mic, language, history.
-- History labels: `HH:MM  first ~40 chars`. Successful items are single click-to-copy entries. Failed items get a ⚠ prefix, and clicking one retries. This removes one submenu level per item. Keep at most 10 entries in the menu.
-- When state is **off** (for example, no API key), the first item becomes **Set API key…** (opens the settings file) and recording is grayed.
-- Keep `TrackPopupMenu` with `TPM_RIGHTBUTTON`, plus the existing `SetForegroundWindow` + `PostMessage(WM_NULL)` dance.
-- Non-goal for now: a custom-drawn (dark-mode) menu. Windows 11 renders classic menus in dark mode only through the undocumented `SetPreferredAppMode` (uxtheme ordinal 135). Calling `SetPreferredAppMode(AllowDark)` before creating the tray window is a one-line experiment worth trying; leave it off if it misbehaves.
-
-## 5. Work breakdown for the implementer
-
-Each step is independently shippable, in this order:
-
-1. **Icons + tooltip** (small). Swap in `out/scribetray.ico`, embed the tray ICOs, add `LoadIconMetric`, theme detection, and `NIM_MODIFY` on state change. Add `NIF_SHOWTIP` and the dynamic tooltip.
-   *Accept:* crisp icons at 100/125/150/200%, the badge follows the state, hover shows the tooltip, and the light/dark taskbar switch updates live.
-2. **Level meter** (small). Add `LevelMeter` in `audio.rs` and the `UiCommand` wiring. Unit-test only the dB→level mapping.
-3. **Overlay renderer** (medium). Add tiny-skia + `UpdateLayeredWindow` and port `frame()` from the prototype. Add DPI scaling, the placement options, and the 33 ms timer lifecycle.
-   *Accept:* it matches `out/overlay-states.png` at 100% and 200%, bars react to speech and stay flat in silence, CPU is under 1% while recording, and the overlay never takes focus.
-4. **Menu restructure** (small–medium). Add submenus, radio items, shortcut text, the default item, flat history, and the off-state first item.
-5. Optional: the `SetPreferredAppMode` dark-menu experiment; `overlay_timer` and `overlay_position` in the config file and README.
-6. Low priority: hollow push-to-talk dot (push-to-talk is lightly used).
-
-## 6. Decisions
-
-1. The error badge clears on the next successful dictation or when History is opened, whichever comes first.
-2. No partial-transcript preview in the overlay, including in realtime mode.
-3. Push-to-talk gets a hollow dot, scheduled last because the mode is rarely used.
+§2 data change → §3 left click → §4 Enter/remove submit hotkey → rebuild for §1 → §5 if time allows. Update README for §3 and §4.
 

@@ -27,6 +27,8 @@ REC = (240, 68, 56)
 WORK = (245, 165, 36)
 ERR = (240, 68, 56)
 OK = (34, 197, 94)
+CORAL = (240, 86, 74)
+BLUE = (59, 139, 255)
 
 
 def mask(size: int) -> tuple[Image.Image, ImageDraw.ImageDraw, float]:
@@ -38,41 +40,33 @@ def down(m: Image.Image, size: int) -> Image.Image:
     return m.resize((size, size), Image.Resampling.BOX)
 
 
-def mic_mask(size: int, slash: bool = False) -> Image.Image:
-    """Solid microphone glyph on a 16-unit grid (reads well at 16 px)."""
-    m, d, k = mask(size)
+def tray_icon(size: int, state: str, theme: str) -> Image.Image:
+    """Candidate C: text caret (I-beam) in the taskbar colour plus a three-bar voice wave.
+
+    The wave colour carries the state; there is no badge.
+    idle = coral, recording = blue, working = amber, error = red x, off = dimmed.
+    """
+    m_caret, dc, k = mask(size)
     s = lambda *v: [round(x * k) for x in v]
-    d.rounded_rectangle(s(5, 1, 11, 10), radius=3 * k, fill=255)  # capsule
-    w = round(1.5 * k)
-    d.arc(s(2.75, 2.5, 13.25, 12.5), start=0, end=180, fill=255, width=w)  # cradle
-    d.rectangle(s(2.75, 6.6, 2.75 + 1.5, 7.6), fill=255)
-    d.rectangle(s(13.25 - 1.5, 6.6, 13.25, 7.6), fill=255)
-    d.rectangle(s(7.25, 12, 8.75, 14.25), fill=255)  # stem
-    d.rounded_rectangle(s(4.75, 13.75, 11.25, 15.25), radius=0.75 * k, fill=255)  # base
-    if slash:
-        gap = Image.new("L", m.size, 0)
-        g = ImageDraw.Draw(gap)
-        g.line(s(1.5, 0.5, 15.5, 14.5), fill=255, width=round(3.5 * k))
-        m = ImageChops.subtract(m, gap)
-        d = ImageDraw.Draw(m)
-        d.line(s(1.5, 0.5, 15.5, 14.5), fill=255, width=round(1.5 * k))
-    return m
-
-
-def badge(size: int, kind: str) -> tuple[Image.Image, Image.Image, Image.Image | None]:
-    """Returns (cutout mask, badge mask, inner-mark mask)."""
-    cx, cy, r, cut = 12.0, 12.0, 3.75, 5.0
-    cm, cd, k = mask(size)
-    cd.ellipse([round((cx - cut) * k), round((cy - cut) * k), round((cx + cut) * k), round((cy + cut) * k)], fill=255)
-    bm, bd, _ = mask(size)
-    bd.ellipse([round((cx - r) * k), round((cy - r) * k), round((cx + r) * k), round((cy + r) * k)], fill=255)
-    mark = None
-    if kind == "error":
-        mark, md, _ = mask(size)
-        a = 1.6
-        md.line([round((cx - a) * k), round((cy - a) * k), round((cx + a) * k), round((cy + a) * k)], fill=255, width=round(1.1 * k))
-        md.line([round((cx - a) * k), round((cy + a) * k), round((cx + a) * k), round((cy - a) * k)], fill=255, width=round(1.1 * k))
-    return cm, bm, mark
+    dc.rectangle(s(3.1, 2, 4.9, 14), fill=255)
+    dc.rounded_rectangle(s(1.25, 1, 6.75, 2.6), radius=0.6 * k, fill=255)
+    dc.rounded_rectangle(s(1.25, 13.4, 6.75, 15), radius=0.6 * k, fill=255)
+    m_wave, dw, _ = mask(size)
+    if state == "error":
+        a, cx, cy = 2.9, 12.0, 8.0
+        dw.line(s(cx - a, cy - a, cx + a, cy + a), fill=255, width=round(2.0 * k))
+        dw.line(s(cx - a, cy + a, cx + a, cy - a), fill=255, width=round(2.0 * k))
+    else:
+        w = 2.0
+        for x, h in ((9.0, 5.5), (12.0, 11.0), (15.0, 5.5)):
+            dw.rounded_rectangle(s(x - w / 2, 8 - h / 2, x + w / 2, 8 + h / 2), radius=w / 2 * k, fill=255)
+    fg = GLYPH[theme]
+    wave = {"idle": CORAL, "recording": BLUE, "working": WORK, "error": ERR, "off": fg}[state]
+    img = compose([(m_caret, fg), (m_wave, wave)], size)
+    if state == "off":
+        alpha = img.getchannel("A").point(lambda v: v * 45 // 100)
+        img.putalpha(alpha)
+    return img
 
 
 def compose(layers: list[tuple[Image.Image, tuple[int, int, int]]], size: int) -> Image.Image:
@@ -83,19 +77,6 @@ def compose(layers: list[tuple[Image.Image, tuple[int, int, int]]], size: int) -
         img = Image.alpha_composite(img, solid)
     return img
 
-
-def tray_icon(size: int, state: str, theme: str) -> Image.Image:
-    glyph = mic_mask(size, slash=(state == "off"))
-    fg = GLYPH[theme]
-    if state in ("idle", "off"):
-        return compose([(glyph, fg)], size)
-    cut, bm, mark = badge(size, state)
-    glyph = ImageChops.subtract(glyph, cut)
-    color = {"recording": REC, "working": WORK, "error": ERR}[state]
-    layers = [(glyph, fg), (bm, color)]
-    if mark is not None:
-        layers.append((mark, (255, 255, 255)))
-    return compose(layers, size)
 
 
 def app_icon(size: int) -> Image.Image:
