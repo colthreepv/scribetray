@@ -21,31 +21,53 @@ under `%LOCALAPPDATA%\Scribetray`.
 ## Use
 
 - **Win+Alt+V** starts or stops recording. **Esc** cancels the current
-  recording.
+  recording. The tray menu can switch to push-to-talk, where holding the
+  configured toggle chord records until you release it.
 - **Win+Alt+Shift+V** records and submits with Enter.
-- The tray menu controls the emoji prefix, Auto-Enter, sound cues, typing mode,
-  language, Start with Windows, and recording history.
-- **Settings and hotkeys…** opens the TOML config. Changes to hotkeys, model,
-  microphone, language, or recording length take effect after restarting the
-  app. Supported hotkey keys are letters, digits, F1–F24, Space, Enter, Tab,
-  and Esc, with Win, Alt, Ctrl, and Shift modifiers.
+- The tray menu can capture a new toggle hotkey and controls push-to-talk,
+  realtime transcription, the emoji prefix, Auto-Enter, sound cues, typing
+  mode, language, Start with Windows, and recording history.
+- **Open settings file…** opens the TOML config. Changes to the submit hotkey,
+  model, microphone, language, or recording length take effect after restarting
+  the app. Supported hotkey keys are letters, digits, F1–F24, Space, Enter,
+  Tab, and Esc, with Win, Alt, Ctrl, and Shift modifiers.
 - Failed uploads keep the PCM recording in history for retry. A focus change
   before insertion sends the transcript to the clipboard instead.
 
 The app reads `ELEVENLABS_API_KEY` first, then `api_key` from the config file.
-`tag_audio_events=false` is sent with each Scribe request.
+Batch Scribe requests send `tag_audio_events=false`. Realtime mode opens a
+`scribe_v2_realtime` WebSocket when recording starts and commits the final audio
+chunk on stop. If that session fails, Scribetray retries the saved audio through
+the batch `scribe_v2` endpoint. Realtime mode is off by default; turn it on in
+the tray menu to use it. Optional `keyterms` in the TOML config are sent as
+Scribe vocabulary hints. The websocket uses ElevenLabs'
+[realtime API](https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime);
+the API reference documents a 20% transcription premium for non-empty keyterm
+lists, so the default list is empty.
+
+Example settings:
+
+```toml
+hotkey = "Win+Alt+V"
+hotkey_submit = "Win+Alt+Shift+V"
+mode = "toggle" # or "push_to_talk"
+realtime = false
+keyterms = []
+```
 
 ## Implementation status
 
-The Rust M1/M2 application builds and starts on Windows. Its startup log
-confirms registration of the default recording and submit hotkeys. It includes
-WASAPI-backed capture through CPAL, Scribe transcription, a non-activating
-recording anchor, clipboard-preserving paste, guarded Unicode typing, local
-history, retry, language selection, optional Enter, and per-user autostart.
+The Rust application builds for `x86_64-pc-windows-msvc`; the M1/M2 startup log
+confirms registration of the default recording and submit hotkeys. M3 compiles
+but still needs a runtime smoke test. The app includes
+WASAPI-backed capture through CPAL, batch and realtime Scribe transcription,
+push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
+clipboard-preserving paste, guarded Unicode typing, local history, retry,
+language selection, optional Enter, and per-user autostart.
 
 The M0 checks identified an outstanding Codex App limitation: the editor's
 focused element and RuntimeId are available, but the tested Win32, MSAA, and
 UIA caret APIs did not return a caret rectangle, so the anchor uses the mouse
 position fallback there. The complete caret and paste round-trip matrix across
 Codex App, Chrome, VS Code, Notepad, and Windows Terminal still needs a manual
-pass. Real-time streaming and push-to-talk remain future work.
+pass, along with realtime transcription and push-to-talk in a desktop smoke test.

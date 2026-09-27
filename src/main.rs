@@ -7,6 +7,8 @@ mod audio;
 mod autostart;
 mod config;
 mod history;
+mod hotkey_dialog;
+mod realtime;
 mod scribe;
 mod windows_ui;
 mod wininput;
@@ -48,6 +50,7 @@ enum Delivery {
 
 struct ActiveRecording {
     recorder: AudioRecorder,
+    realtime_result: Option<Receiver<Result<Transcription, String>>>,
     target: TargetSnapshot,
     started: Instant,
     submit_on_complete: bool,
@@ -187,6 +190,25 @@ fn handle_ui_event(
                 start_recording(active, true, config, ui, done_until);
             }
         }
+        UiEvent::PushToTalkPressed => {
+            if active.is_none() {
+                start_recording(active, false, config, ui, done_until);
+            }
+        }
+        UiEvent::PushToTalkReleased => {
+            if active.is_some() {
+                stop_recording(
+                    active,
+                    false,
+                    config,
+                    ui,
+                    history,
+                    worker_tx,
+                    deliveries,
+                    submit_after_transcription,
+                );
+            }
+        }
         UiEvent::CancelRecord => {
             if active.take().is_some() {
                 info!("recording cancelled");
@@ -200,6 +222,31 @@ fn handle_ui_event(
             if let Err(error) = open_config_file() {
                 show_notice(ui, "Scribetray settings", &error);
             }
+        }
+        UiEvent::CaptureToggleHotkey => {
+            match hotkey_dialog::capture_hotkey(ui.native_window_handle()) {
+                Ok(Some(hotkey)) => match parse_hotkey(&hotkey) {
+                    Ok(_) => {
+                        config.hotkey = hotkey;
+                        save_config(config, ui);
+                    }
+                    Err(error) => show_notice(ui, "Scribetray hotkey", &error),
+                },
+                Ok(None) => {}
+                Err(error) => show_notice(ui, "Scribetray hotkey", &error),
+            }
+        }
+        UiEvent::ToggleRecordingMode => {
+            config.mode = if config.mode.eq_ignore_ascii_case("push_to_talk") {
+                "toggle".to_owned()
+            } else {
+                "push_to_talk".to_owned()
+            };
+            save_config(config, ui);
+        }
+        UiEvent::ToggleRealtime => {
+            config.realtime = !config.realtime;
+            save_config(config, ui);
         }
         UiEvent::TogglePrefix => {
             config.prefix_enabled = !config.prefix_enabled;
@@ -275,6 +322,11 @@ fn handle_ui_event(
         },
         UiEvent::HotkeyRegistrationFailed { error, .. } => warn!("{error}"),
         UiEvent::EscapeRegistrationFailed { error } => warn!("Escape hotkey unavailable: {error}"),
+        UiEvent::PushToTalkHookFailed { error } => {
+            warn!("{error}");
+            config.mode = "toggle".to_owned();
+            save_config(config, ui);
+        }
     }
 
     *ui_settings = make_ui_settings(config, history.list().unwrap_or_default());
@@ -302,11 +354,64 @@ fn start_recording(
             return;
         }
     };
-    let recorder = match AudioRecorder::start(config.microphone.as_deref(), config.max_seconds) {
-        Ok(recorder) => recorder,
-        Err(error) => {
-            show_notice(ui, "Scribetray microphone", &error.to_string());
-            return;
+    let (recorder, realtime_result) = if config.realtime
+        && let Some(api_key) = config.resolved_api_key()
+    {
+        let keyterms = match realtime::validate_keyterms(&config.keyterms) {
+            Ok(keyterms) => keyterms,
+            Err(error) => {
+                show_notice(ui, "Scribetray vocabulary", &error.to_string());
+                return;
+            }
+        };
+        let (recorder, audio_chunks) =
+            match AudioRecorder::start_realtime(config.microphone.as_deref(), config.max_seconds) {
+                Ok(started) => started,
+                Err(error) => {
+                    show_notice(ui, "Scribetray microphone", &error.to_string());
+                    return;
+                }
+            };
+        let (result_tx, result_rx) = mpsc::channel();
+        let language = language_for_api(&config.language);
+        match thread::Builder::new()
+            .name("scribetray-realtime".to_owned())
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "Could not start the realtime transcription runtime.".to_owned())
+                    .and_then(|runtime| {
+                        runtime
+                            .block_on(realtime::transcribe_stream(
+                                &api_key,
+                                language.as_deref(),
+                                &keyterms,
+                                audio_chunks,
+                            ))
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = result_tx.send(result);
+            }) {
+            Ok(_) => (recorder, Some(result_rx)),
+            Err(error) => {
+                show_notice(
+                    ui,
+                    "Scribetray realtime",
+                    &format!(
+                        "Could not start the realtime connection; batch transcription will be used: {error}"
+                    ),
+                );
+                (recorder, None)
+            }
+        }
+    } else {
+        match AudioRecorder::start(config.microphone.as_deref(), config.max_seconds) {
+            Ok(recorder) => (recorder, None),
+            Err(error) => {
+                show_notice(ui, "Scribetray microphone", &error.to_string());
+                return;
+            }
         }
     };
 
@@ -317,6 +422,7 @@ fn start_recording(
     );
     *active = Some(ActiveRecording {
         recorder,
+        realtime_result,
         target,
         started: Instant::now(),
         submit_on_complete,
@@ -342,6 +448,7 @@ fn stop_recording(
         return;
     };
     let target = active_recording.target;
+    let realtime_result = active_recording.realtime_result;
     let enter_after = active_recording.submit_on_complete || submit_hotkey;
     let captured = match active_recording.recorder.stop() {
         Ok(captured) => captured,
@@ -362,23 +469,102 @@ fn stop_recording(
             if let Some(rect) = anchor {
                 let _ = ui.update_caret_anchor(rect, AnchorStatus::Working);
             }
-            start_transcription(
-                recording,
-                captured.pcm_16k_mono,
-                Delivery::Paste(target),
-                enter_after,
-                config,
-                ui,
-                history,
-                worker_tx,
-                deliveries,
-                submit_after_transcription,
-            );
+            if let Some(realtime_result) = realtime_result {
+                start_streaming_transcription(
+                    recording,
+                    captured.pcm_16k_mono,
+                    realtime_result,
+                    Delivery::Paste(target),
+                    enter_after,
+                    config,
+                    ui,
+                    history,
+                    worker_tx,
+                    deliveries,
+                    submit_after_transcription,
+                );
+            } else {
+                start_transcription(
+                    recording,
+                    captured.pcm_16k_mono,
+                    Delivery::Paste(target),
+                    enter_after,
+                    config,
+                    ui,
+                    history,
+                    worker_tx,
+                    deliveries,
+                    submit_after_transcription,
+                );
+            }
         }
         Err(error) => {
             let _ = ui.hide_caret_anchor();
             show_notice(ui, "Scribetray history", &error.to_string());
         }
+    }
+    refresh_history_menu(ui, history);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_streaming_transcription(
+    recording: Recording,
+    pcm: Vec<u8>,
+    realtime_result: Receiver<Result<Transcription, String>>,
+    delivery: Delivery,
+    enter_after: bool,
+    config: &Config,
+    ui: &UiRuntime,
+    history: &History,
+    worker_tx: &Sender<WorkerFinished>,
+    deliveries: &mut HashMap<String, Delivery>,
+    submit_after_transcription: &mut HashMap<String, bool>,
+) {
+    let id = recording.id;
+    deliveries.insert(id.clone(), delivery);
+    submit_after_transcription.insert(id.clone(), enter_after);
+
+    let sender = worker_tx.clone();
+    let api_key = config.resolved_api_key();
+    let model = config.model.clone();
+    let language = language_for_api(&config.language);
+    let job_id = id.clone();
+    let task = thread::Builder::new()
+        .name("scribetray-transcription".to_owned())
+        .spawn(move || {
+            let realtime = realtime_result
+                .recv()
+                .unwrap_or_else(|_| Err("Realtime transcription worker stopped unexpectedly.".to_owned()));
+            let result = match realtime {
+                Ok(transcription) => Ok(transcription),
+                Err(realtime_error) => match api_key {
+                    Some(api_key) => ScribeClient::new()
+                        .and_then(|client| {
+                            client.transcribe(&api_key, &pcm, &model, language.as_deref())
+                        })
+                        .map_err(|batch_error| {
+                            format!(
+                                "Realtime transcription failed ({realtime_error}); batch retry failed ({batch_error})."
+                            )
+                        }),
+                    None => Err("ELEVENLABS_API_KEY is not configured".to_owned()),
+                },
+            };
+            let _ = sender.send(WorkerFinished {
+                history_id: job_id,
+                result,
+            });
+        });
+
+    if let Err(error) = task {
+        deliveries.remove(&id);
+        submit_after_transcription.remove(&id);
+        let _ = history.mark_failed(&id, "Could not start transcription worker");
+        show_notice(
+            ui,
+            "Scribetray",
+            &format!("Could not start transcription: {error}"),
+        );
     }
     refresh_history_menu(ui, history);
 }
@@ -660,6 +846,8 @@ fn make_ui_settings(config: &Config, recordings: Vec<Recording>) -> UiSettings {
     UiSettings {
         toggle_hotkey,
         submit_hotkey,
+        push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
+        realtime_enabled: config.realtime,
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
         sound_enabled: config.sound_cues,

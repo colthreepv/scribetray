@@ -34,6 +34,10 @@ pub struct Config {
     pub hotkey_submit: String,
     /// Recording interaction mode (for example, `toggle` or `push_to_talk`).
     pub mode: String,
+    /// Stream audio to Scribe as it is recorded instead of using batch transcription.
+    pub realtime: bool,
+    /// Optional vocabulary hints for Scribe; non-empty lists incur ElevenLabs' keyterm premium.
+    pub keyterms: Vec<String>,
     /// ElevenLabs speech-to-text model identifier.
     pub model: String,
     /// An ElevenLabs language code, or `auto` to detect it from the audio.
@@ -61,6 +65,8 @@ impl fmt::Debug for Config {
             .field("hotkey", &self.hotkey)
             .field("hotkey_submit", &self.hotkey_submit)
             .field("mode", &self.mode)
+            .field("realtime", &self.realtime)
+            .field("keyterms", &self.keyterms)
             .field("model", &self.model)
             .field("language", &self.language)
             .field("prefix", &self.prefix)
@@ -83,6 +89,8 @@ impl Default for Config {
             hotkey: "Win+Alt+V".to_owned(),
             hotkey_submit: "Win+Alt+Shift+V".to_owned(),
             mode: "toggle".to_owned(),
+            realtime: false,
+            keyterms: Vec::new(),
             model: DEFAULT_MODEL.to_owned(),
             language: DEFAULT_LANGUAGE_CODE.to_owned(),
             prefix: "🎙️ ".to_owned(),

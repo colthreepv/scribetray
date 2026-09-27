@@ -10,6 +10,7 @@ use cpal::{
     FromSample, Sample, SampleFormat, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const OUTPUT_RATE: u32 = 16_000;
 const FILTER_LEFT: i64 = 15;
@@ -62,6 +63,24 @@ pub struct AudioRecorder {
 impl AudioRecorder {
     /// Starts shared-mode capture from the named device, or the system default.
     pub fn start(device_name: Option<&str>, max_seconds: u32) -> Result<Self, AudioError> {
+        Self::start_with_stream(device_name, max_seconds, None)
+    }
+
+    /// Starts capture and forwards resampled PCM in roughly 100 ms chunks.
+    pub fn start_realtime(
+        device_name: Option<&str>,
+        max_seconds: u32,
+    ) -> Result<(Self, UnboundedReceiver<Vec<u8>>), AudioError> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = Self::start_with_stream(device_name, max_seconds, Some(sender))?;
+        Ok((recorder, receiver))
+    }
+
+    fn start_with_stream(
+        device_name: Option<&str>,
+        max_seconds: u32,
+        realtime_sender: Option<UnboundedSender<Vec<u8>>>,
+    ) -> Result<Self, AudioError> {
         if max_seconds == 0 {
             return Err(AudioError::InvalidMaxSeconds);
         }
@@ -96,6 +115,7 @@ impl AudioRecorder {
             max_input_frames,
             max_output_samples,
             max_output_bytes,
+            realtime_sender,
         )));
         let stream_error = Arc::new(Mutex::new(None));
         let limit_reached = Arc::new(AtomicBool::new(false));
@@ -358,6 +378,8 @@ struct CaptureState {
     max_input_frames: u64,
     max_output_samples: usize,
     max_output_bytes: usize,
+    realtime_sender: Option<UnboundedSender<Vec<u8>>>,
+    realtime_chunk: Vec<u8>,
     input: VecDeque<f32>,
     input_base: u64,
     input_count: u64,
@@ -372,6 +394,7 @@ impl CaptureState {
         max_input_frames: u64,
         max_output_samples: u64,
         max_output_bytes: usize,
+        realtime_sender: Option<UnboundedSender<Vec<u8>>>,
     ) -> Self {
         let max_output_samples = max_output_samples as usize;
         Self {
@@ -380,6 +403,8 @@ impl CaptureState {
             max_input_frames,
             max_output_samples,
             max_output_bytes,
+            realtime_sender,
+            realtime_chunk: Vec::with_capacity(3_200),
             input: VecDeque::with_capacity(64),
             input_base: 0,
             input_count: 0,
@@ -435,6 +460,11 @@ impl CaptureState {
             .saturating_add((remainder * u64::from(OUTPUT_RATE)).div_ceil(rate))
             .min(self.max_output_samples as u64) as usize;
         self.produce_until(Some(target_samples));
+        if let Some(sender) = &self.realtime_sender
+            && !self.realtime_chunk.is_empty()
+        {
+            let _ = sender.send(std::mem::take(&mut self.realtime_chunk));
+        }
     }
 
     fn produce_until(&mut self, flush_target: Option<usize>) {
@@ -462,6 +492,14 @@ impl CaptureState {
                 self.pcm.reserve_exact(additional);
             }
             self.pcm.extend_from_slice(&pcm_sample);
+            if let Some(sender) = &self.realtime_sender {
+                self.realtime_chunk.extend_from_slice(&pcm_sample);
+                if self.realtime_chunk.len() >= 3_200 {
+                    let chunk =
+                        std::mem::replace(&mut self.realtime_chunk, Vec::with_capacity(3_200));
+                    let _ = sender.send(chunk);
+                }
+            }
             self.output_samples += 1;
         }
 

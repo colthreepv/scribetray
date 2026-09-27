@@ -8,6 +8,7 @@
 #![cfg(windows)]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     mem::size_of,
     sync::mpsc::{self, Receiver, Sender},
@@ -36,19 +37,20 @@ use windows::{
                 NOTIFYICONDATAW_0, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW,
-                GetSystemMetrics, GetWindowLongPtrW, HWND_TOPMOST, IDI_APPLICATION, KillTimer,
-                LWA_COLORKEY, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-                PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXVIRTUALSCREEN,
-                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE,
-                SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
-                SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-                UnregisterClassW, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
-                WM_HOTKEY, WM_LBUTTONUP, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
-                WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-                WS_POPUP,
+                AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos,
+                GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HHOOK, HWND_TOPMOST,
+                IDI_APPLICATION, KBDLLHOOKSTRUCT, KillTimer, LWA_COLORKEY, LoadIconW, MF_CHECKED,
+                MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW,
+                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
+                SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
+                SetWindowPos, SetWindowsHookExW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+                TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+                UnregisterClassW, WH_KEYBOARD_LL, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+                WM_DISPLAYCHANGE, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NCCREATE,
+                WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
+                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -67,6 +69,10 @@ const TIMER_RECORDING: usize = 0x5343;
 const OVERLAY_WIDTH: i32 = 152;
 const OVERLAY_HEIGHT: i32 = 44;
 const COLOR_KEY: COLORREF = COLORREF(0x00ff00ff);
+
+thread_local! {
+    static PUSH_TO_TALK_HOOK_STATE: RefCell<Option<PushToTalkHookState>> = const { RefCell::new(None) };
+}
 
 /// Modifier keys for a configurable global hotkey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +213,8 @@ pub struct HistoryMenuItem {
 pub struct UiSettings {
     pub toggle_hotkey: Hotkey,
     pub submit_hotkey: Hotkey,
+    pub push_to_talk: bool,
+    pub realtime_enabled: bool,
     pub prefix_enabled: bool,
     pub auto_enter: bool,
     pub sound_enabled: bool,
@@ -226,6 +234,8 @@ impl Default for UiSettings {
                 "V",
                 HotkeyModifiers::new(true, false),
             ),
+            push_to_talk: false,
+            realtime_enabled: false,
             prefix_enabled: true,
             auto_enter: false,
             sound_enabled: true,
@@ -285,9 +295,14 @@ pub enum HotkeyPurpose {
 pub enum UiEvent {
     ToggleRecord,
     SubmitHotkeyRecord,
+    PushToTalkPressed,
+    PushToTalkReleased,
     CancelRecord,
     Quit,
     OpenConfig,
+    CaptureToggleHotkey,
+    ToggleRecordingMode,
+    ToggleRealtime,
     TogglePrefix,
     ToggleAutoEnter,
     ToggleSound,
@@ -302,6 +317,9 @@ pub enum UiEvent {
         error: String,
     },
     EscapeRegistrationFailed {
+        error: String,
+    },
+    PushToTalkHookFailed {
         error: String,
     },
 }
@@ -380,6 +398,11 @@ impl UiRuntime {
     pub fn hide_caret_anchor(&self) -> Result<(), String> {
         self.send(UiCommand::HideAnchor)
     }
+
+    /// Raw hidden tray HWND for native modal dialogs owned by the application.
+    pub fn native_window_handle(&self) -> isize {
+        self.hwnd.0 as isize
+    }
 }
 
 impl Drop for UiRuntime {
@@ -411,6 +434,7 @@ struct UiState {
     anchor_rect: Option<CaretRect>,
     anchor_status: Option<AnchorStatus>,
     recording_started: Option<Instant>,
+    push_to_talk_hook: Option<HHOOK>,
 }
 
 fn run_ui_thread(
@@ -429,6 +453,7 @@ fn run_ui_thread(
 
     let hwnd = state.tray_hwnd.0 as isize;
     state.register_hotkeys();
+    state.update_push_to_talk_hook();
     let _ = ready.send(Ok(hwnd));
 
     loop {
@@ -498,6 +523,7 @@ fn create_ui_state(
         anchor_rect: None,
         anchor_status: None,
         recording_started: None,
+        push_to_talk_hook: None,
     });
     let state_ptr = (&mut *state as *mut UiState).cast::<core::ffi::c_void>();
     let class_name = PCWSTR(state.class_name.as_ptr());
@@ -583,11 +609,15 @@ impl UiState {
         self.unregister_record_hotkeys();
         let toggle = self.settings.toggle_hotkey.clone();
         let submit = self.settings.submit_hotkey.clone();
-        self.toggle_registered = self.register_record_hotkey(
-            HOTKEY_TOGGLE_ID,
-            HotkeyPurpose::ToggleRecording,
-            toggle.clone(),
-        );
+        self.toggle_registered = if self.settings.push_to_talk {
+            false
+        } else {
+            self.register_record_hotkey(
+                HOTKEY_TOGGLE_ID,
+                HotkeyPurpose::ToggleRecording,
+                toggle.clone(),
+            )
+        };
 
         if toggle.virtual_key == submit.virtual_key && toggle.modifiers == submit.modifiers {
             self.hotkey_failure(
@@ -698,9 +728,11 @@ impl UiState {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey
                     || self.settings.submit_hotkey != settings.submit_hotkey;
+                let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
                 self.settings = settings;
-                if hotkeys_changed {
+                if hotkeys_changed || mode_changed {
                     self.register_hotkeys();
+                    self.update_push_to_talk_hook();
                 }
             }
             UiCommand::UpdateHistory(history) => self.settings.history = history,
@@ -827,6 +859,7 @@ impl UiState {
     }
 
     fn cleanup(&mut self) {
+        self.remove_push_to_talk_hook();
         self.unregister_escape();
         self.unregister_record_hotkeys();
         unsafe {
@@ -852,6 +885,158 @@ impl UiState {
             let _ = UnregisterClassW(PCWSTR(self.class_name.as_ptr()), Some(self.instance));
         }
     }
+
+    fn update_push_to_talk_hook(&mut self) {
+        if self.settings.push_to_talk {
+            if self.push_to_talk_hook.is_some() {
+                PUSH_TO_TALK_HOOK_STATE.with(|state| {
+                    if let Some(state) = state.borrow_mut().as_mut() {
+                        state.hotkey = self.settings.toggle_hotkey.clone();
+                        state.engaged = false;
+                        state.pressed_modifiers = 0;
+                    }
+                });
+                return;
+            }
+
+            PUSH_TO_TALK_HOOK_STATE.with(|state| {
+                *state.borrow_mut() = Some(PushToTalkHookState {
+                    events: self.events.clone(),
+                    hotkey: self.settings.toggle_hotkey.clone(),
+                    pressed_modifiers: 0,
+                    engaged: false,
+                });
+            });
+            match unsafe {
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(push_to_talk_keyboard_hook),
+                    Some(self.instance),
+                    0,
+                )
+            } {
+                Ok(hook) => self.push_to_talk_hook = Some(hook),
+                Err(error) => {
+                    PUSH_TO_TALK_HOOK_STATE.with(|state| *state.borrow_mut() = None);
+                    let _ = self.events.send(UiEvent::PushToTalkHookFailed {
+                        error: format!("Could not enable push-to-talk keyboard capture: {error}"),
+                    });
+                    self.show_notice(
+                        TITLE,
+                        "Could not enable push-to-talk keyboard capture. Toggle mode remains available.",
+                    );
+                }
+            }
+        } else {
+            self.remove_push_to_talk_hook();
+        }
+    }
+
+    fn remove_push_to_talk_hook(&mut self) {
+        if let Some(hook) = self.push_to_talk_hook.take() {
+            let _ = unsafe { UnhookWindowsHookEx(hook) };
+        }
+        PUSH_TO_TALK_HOOK_STATE.with(|state| *state.borrow_mut() = None);
+    }
+}
+
+struct PushToTalkHookState {
+    events: Sender<UiEvent>,
+    hotkey: Hotkey,
+    pressed_modifiers: u8,
+    engaged: bool,
+}
+
+unsafe extern "system" fn push_to_talk_keyboard_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    let keyboard = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    let message = wparam.0 as u32;
+    let key_down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
+    let key_up = matches!(message, WM_KEYUP | WM_SYSKEYUP);
+    if !key_down && !key_up {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    let mut swallow = false;
+    PUSH_TO_TALK_HOOK_STATE.with(|state| {
+        let mut slot = state.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        if let Some(bit) = modifier_bit(keyboard.vkCode) {
+            if key_down {
+                state.pressed_modifiers |= bit;
+            } else {
+                state.pressed_modifiers &= !bit;
+            }
+        }
+
+        let is_trigger_key = keyboard.vkCode == state.hotkey.virtual_key;
+        if key_down && is_trigger_key {
+            if state.engaged {
+                swallow = true;
+            } else if modifiers_match(state) {
+                state.engaged = true;
+                swallow = true;
+                let _ = state.events.send(UiEvent::PushToTalkPressed);
+            }
+        } else if state.engaged
+            && ((key_up && is_trigger_key) || (key_up && !modifiers_match(state)))
+        {
+            state.engaged = false;
+            if is_trigger_key {
+                swallow = true;
+            }
+            let _ = state.events.send(UiEvent::PushToTalkReleased);
+        }
+    });
+
+    if swallow {
+        LRESULT(1)
+    } else {
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+}
+
+fn modifier_bit(virtual_key: u32) -> Option<u8> {
+    match virtual_key {
+        0x5B => Some(1 << 0), // Left Windows
+        0x5C => Some(1 << 1), // Right Windows
+        0xA4 => Some(1 << 2), // Left Alt
+        0xA5 => Some(1 << 3), // Right Alt
+        0xA2 => Some(1 << 4), // Left Ctrl
+        0xA3 => Some(1 << 5), // Right Ctrl
+        0xA0 => Some(1 << 6), // Left Shift
+        0xA1 => Some(1 << 7), // Right Shift
+        0x12 => Some((1 << 2) | (1 << 3)),
+        0x11 => Some((1 << 4) | (1 << 5)),
+        0x10 => Some((1 << 6) | (1 << 7)),
+        _ => None,
+    }
+}
+
+fn modifiers_match(state: &PushToTalkHookState) -> bool {
+    let pressed = state.pressed_modifiers;
+    let actual = [
+        pressed & 0b0000_0011 != 0,
+        pressed & 0b0000_1100 != 0,
+        pressed & 0b0011_0000 != 0,
+        pressed & 0b1100_0000 != 0,
+    ];
+    let required = [
+        state.hotkey.modifiers.win,
+        state.hotkey.modifiers.alt,
+        state.hotkey.modifiers.control,
+        state.hotkey.modifiers.shift,
+    ];
+    actual == required
 }
 
 fn overlay_position(caret: CaretRect) -> (i32, i32) {
@@ -904,11 +1089,38 @@ fn build_tray_menu(
     append_separator(root.0)?;
     append_action(
         root.0,
-        "Settings and hotkeys…",
+        &format!(
+            "Change toggle hotkey ({})…",
+            settings.toggle_hotkey.combo_label()
+        ),
         2,
+        UiEvent::CaptureToggleHotkey,
+        &mut actions,
+    )?;
+    append_action(
+        root.0,
+        "Open settings file…",
+        3,
         UiEvent::OpenConfig,
         &mut actions,
     )?;
+    append_check_action(
+        root.0,
+        "Push-to-talk mode",
+        10,
+        settings.push_to_talk,
+        UiEvent::ToggleRecordingMode,
+        &mut actions,
+    )?;
+    append_check_action(
+        root.0,
+        "Realtime Scribe",
+        11,
+        settings.realtime_enabled,
+        UiEvent::ToggleRealtime,
+        &mut actions,
+    )?;
+    append_separator(root.0)?;
     append_check_action(
         root.0,
         "Emoji prefix",
