@@ -1,0 +1,4 @@
+**/target/
+/dist/
+AGENTS.md
+*.pdb
