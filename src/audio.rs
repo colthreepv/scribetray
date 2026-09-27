@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -18,10 +18,37 @@ const FILTER_RIGHT: i64 = 16;
 const FILTER_RADIUS: f64 = 16.0;
 const INITIAL_RESERVE_SAMPLES: usize = OUTPUT_RATE as usize;
 
+/// How often the input callback folds accumulated energy into the envelope.
+const LEVEL_WINDOW_MS: u32 = 20;
+/// Level below which the meter reports silence, in dBFS.
+const LEVEL_FLOOR_DB: f32 = -52.0;
+/// dBFS span mapped onto the 0..=1 level range above the floor.
+const LEVEL_RANGE_DB: f32 = 40.0;
+/// Per-window envelope attack/release smoothing factors.
+const LEVEL_ATTACK: f32 = 0.6;
+const LEVEL_RELEASE: f32 = 0.15;
+
 /// A completed mono recording encoded as signed 16-bit little-endian PCM.
 pub struct Recording {
     pub pcm_16k_mono: Vec<u8>,
     pub duration_seconds: u32,
+}
+
+/// A cheap, cloneable handle to a recorder's live output level.
+///
+/// The value is the smoothed RMS envelope of the mono input, already mapped
+/// onto the `0.0..=1.0` range. It is updated inside the CPAL callback through
+/// a single atomic store, so reading it never blocks audio capture.
+#[derive(Clone, Debug)]
+pub struct LevelMeter {
+    bits: Arc<AtomicU32>,
+}
+
+impl LevelMeter {
+    /// Returns the current envelope level clamped to `0.0..=1.0`.
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
 }
 
 /// Errors that can occur while selecting an input device or recording audio.
@@ -57,6 +84,7 @@ pub struct AudioRecorder {
     capture: Arc<Mutex<CaptureState>>,
     stream_error: Arc<Mutex<Option<String>>>,
     limit_reached: Arc<AtomicBool>,
+    level: Arc<AtomicU32>,
     max_seconds: u32,
 }
 
@@ -109,6 +137,7 @@ impl AudioRecorder {
             .ok_or(AudioError::CapacityOverflow)?;
         let max_input_frames = u64::from(max_seconds) * u64::from(sample_rate);
 
+        let level = Arc::new(AtomicU32::new(0));
         let capture = Arc::new(Mutex::new(CaptureState::new(
             sample_rate,
             channels,
@@ -116,6 +145,7 @@ impl AudioRecorder {
             max_output_samples,
             max_output_bytes,
             realtime_sender,
+            level.clone(),
         )));
         let stream_error = Arc::new(Mutex::new(None));
         let limit_reached = Arc::new(AtomicBool::new(false));
@@ -219,6 +249,7 @@ impl AudioRecorder {
             capture,
             stream_error,
             limit_reached,
+            level,
             max_seconds,
         })
     }
@@ -260,6 +291,13 @@ impl AudioRecorder {
     /// Returns true once capture has reached its configured duration limit.
     pub fn limit_reached(&self) -> bool {
         self.limit_reached.load(Ordering::Acquire)
+    }
+
+    /// Returns a cheap, cloneable handle to the live input level meter.
+    pub fn level_meter(&self) -> LevelMeter {
+        LevelMeter {
+            bits: self.level.clone(),
+        }
     }
 
     /// Returns the available input device names for the tray microphone menu.
@@ -404,6 +442,11 @@ struct CaptureState {
     input_count: u64,
     output_samples: usize,
     pcm: Vec<u8>,
+    level: Arc<AtomicU32>,
+    level_window_frames: u64,
+    level_square_sum: f64,
+    level_frames: u64,
+    level_envelope: f32,
 }
 
 impl CaptureState {
@@ -414,8 +457,11 @@ impl CaptureState {
         max_output_samples: u64,
         max_output_bytes: usize,
         realtime_sender: Option<UnboundedSender<Vec<u8>>>,
+        level: Arc<AtomicU32>,
     ) -> Self {
         let max_output_samples = max_output_samples as usize;
+        let level_window_frames =
+            (u64::from(sample_rate) / (1_000 / u64::from(LEVEL_WINDOW_MS))).max(1);
         Self {
             sample_rate,
             channels: usize::from(channels),
@@ -429,6 +475,11 @@ impl CaptureState {
             input_count: 0,
             output_samples: 0,
             pcm: Vec::with_capacity(max_output_bytes.min(INITIAL_RESERVE_SAMPLES * 2)),
+            level,
+            level_window_frames,
+            level_square_sum: 0.0,
+            level_frames: 0,
+            level_envelope: 0.0,
         }
     }
 
@@ -458,6 +509,7 @@ impl CaptureState {
             let mono = (sum / self.channels as f64).clamp(-1.0, 1.0) as f32;
             self.input.push_back(mono);
             self.input_count += 1;
+            self.accumulate_level(mono);
             self.produce_until(None);
 
             if self.input_count >= self.max_input_frames
@@ -468,6 +520,33 @@ impl CaptureState {
         }
 
         false
+    }
+
+    /// Folds one mono sample into the RMS envelope, publishing roughly every
+    /// `LEVEL_WINDOW_MS`. The callback only ever performs arithmetic and one
+    /// relaxed atomic store; no allocation or cross-thread send happens here.
+    fn accumulate_level(&mut self, mono: f32) {
+        self.level_square_sum += f64::from(mono) * f64::from(mono);
+        self.level_frames += 1;
+        if self.level_frames < self.level_window_frames {
+            return;
+        }
+
+        let rms = (self.level_square_sum / self.level_frames as f64).sqrt() as f32;
+        let db = 20.0 * (rms + 1e-9).log10();
+        let target = ((db - LEVEL_FLOOR_DB) / LEVEL_RANGE_DB).clamp(0.0, 1.0);
+        let smoothing = if target > self.level_envelope {
+            LEVEL_ATTACK
+        } else {
+            LEVEL_RELEASE
+        };
+        self.level_envelope =
+            (self.level_envelope + (target - self.level_envelope) * smoothing).clamp(0.0, 1.0);
+        self.level
+            .store(self.level_envelope.to_bits(), Ordering::Relaxed);
+
+        self.level_square_sum = 0.0;
+        self.level_frames = 0;
     }
 
     fn finish(&mut self) {

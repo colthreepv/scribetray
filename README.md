@@ -35,7 +35,11 @@ under `%LOCALAPPDATA%\Scribetray`.
 - Failed uploads keep the PCM recording in history for retry. A focus change
   before insertion sends the transcript to the clipboard instead.
 - History entries show the local date and recording duration. Successful entries
-  have no redundant “Done” label; pending and failed entries keep their status.
+  include a short transcript preview; pending and failed entries keep their
+  status. There is no redundant “Done” label.
+- While recording, a compact non-activating pill follows the caret. Its waveform
+  reacts to the live microphone level; the tray icon and tooltip show recording,
+  transcription, setup, and error states.
 
 The app reads `ELEVENLABS_API_KEY` first, then `api_key` from the config file.
 Batch Scribe requests send `tag_audio_events=false`. Realtime mode opens a
@@ -63,6 +67,21 @@ keyterms = []
 insert_method = "type" # or "paste"
 ```
 
+## Versioning
+
+Release versions follow the implementation milestones: M0 was a disposable
+spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, and M3 to `v0.3.x`. The current
+build is `v0.3.0`; patch numbers increase for fixes within the current
+milestone. The tray tooltip shows the running version.
+
+Scribetray is a per-user desktop application and needs no installer or
+administrator rights. It can run directly from this repository's
+`target/release/scribetray.exe`; settings and history are stored in the user's
+Windows profile. “Start with Windows” launches the executable path saved at
+the time it is enabled, so keep that path stable while using autostart. There
+is no Windows Service mode; Scribetray needs the interactive desktop for its
+tray icon, global hotkeys, microphone, and text-field insertion.
+
 ## Implementation status
 
 The Rust application builds for `x86_64-pc-windows-msvc`; the M1/M2 startup log
@@ -84,6 +103,12 @@ speed penalty with Type mode. New installations now default to Type mode; the
 complete caret and insertion compatibility matrix across Codex App, Chrome,
 VS Code, Notepad, and Windows Terminal remains to be verified. Windows Terminal
 is a secondary compatibility check, not a primary dictation workflow.
+
+The tray menu groups recording and insertion settings, uses radio choices for
+mutually exclusive modes, shows the configured hotkeys, and previews recent
+history entries. Tray icons adapt to both app state and Windows taskbar theme.
+The overlay uses a DPI-scaled alpha-rendered waveform and reads the recorder's
+non-blocking live level meter.
 
 The latest desktop feedback reports that message-beep sound cues were inaudible,
 and that Paste mode can leave the clipboard replaced and skip Auto-Enter. The

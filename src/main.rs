@@ -48,7 +48,7 @@ use wininput::{InsertMethod, TargetSnapshot};
 const APP_DIRECTORY: &str = "Scribetray";
 const TICK: Duration = Duration::from_millis(200);
 const CARET_REFRESH: Duration = Duration::from_millis(250);
-const DONE_DISPLAY: Duration = Duration::from_millis(1_200);
+const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
 const CUE_SAMPLE_RATE: u32 = 22_050;
 
 static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
@@ -223,6 +223,7 @@ fn run() -> Result<(), String> {
     if let Some(recording) = active.take() {
         drop(recording);
         let _ = ui.send(UiCommand::SetRecording(false));
+        let _ = ui.send(UiCommand::SetLevelMeter(None));
         let _ = ui.hide_caret_anchor();
     }
     info!("Scribetray stopped");
@@ -298,6 +299,7 @@ fn handle_ui_event(
             if active.take().is_some() {
                 info!("recording cancelled");
                 let _ = ui.send(UiCommand::SetRecording(false));
+                let _ = ui.send(UiCommand::SetLevelMeter(None));
                 let _ = ui.hide_caret_anchor();
                 play_cue(config.sound_cues, 0x10);
             }
@@ -371,44 +373,50 @@ fn handle_ui_event(
             config.language = language;
             save_config(config, ui);
         }
-        UiEvent::HistoryCopy(id) => match history.get(&id) {
-            Ok(recording) => match recording.transcript {
-                Some(transcript) => match wininput::copy_text(&transcript) {
-                    Ok(()) => {
-                        show_notice(ui, "Scribetray history", "Transcript copied to clipboard.")
-                    }
-                    Err(error) => show_notice(
+        UiEvent::HistoryCopy(id) => {
+            let _ = ui.send(UiCommand::SetTrayError(false));
+            match history.get(&id) {
+                Ok(recording) => match recording.transcript {
+                    Some(transcript) => match wininput::copy_text(&transcript) {
+                        Ok(()) => {
+                            show_notice(ui, "Scribetray history", "Transcript copied to clipboard.")
+                        }
+                        Err(error) => show_notice(
+                            ui,
+                            "Scribetray history",
+                            &format!("Could not copy transcript: {error}"),
+                        ),
+                    },
+                    None => show_notice(
                         ui,
                         "Scribetray history",
-                        &format!("Could not copy transcript: {error}"),
+                        "This recording has no transcript yet.",
                     ),
                 },
-                None => show_notice(
-                    ui,
-                    "Scribetray history",
-                    "This recording has no transcript yet.",
-                ),
-            },
-            Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
-        },
-        UiEvent::HistoryRetry(id) => match history.get(&id) {
-            Ok(recording) => match history.read_audio(&id) {
-                Ok(pcm) => start_transcription(
-                    recording,
-                    pcm,
-                    Delivery::Clipboard,
-                    false,
-                    config,
-                    ui,
-                    history,
-                    worker_tx,
-                    deliveries,
-                    submit_after_transcription,
-                ),
                 Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
-            },
-            Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
-        },
+            }
+        }
+        UiEvent::HistoryRetry(id) => {
+            let _ = ui.send(UiCommand::SetTrayError(false));
+            match history.get(&id) {
+                Ok(recording) => match history.read_audio(&id) {
+                    Ok(pcm) => start_transcription(
+                        recording,
+                        pcm,
+                        Delivery::Clipboard,
+                        false,
+                        config,
+                        ui,
+                        history,
+                        worker_tx,
+                        deliveries,
+                        submit_after_transcription,
+                    ),
+                    Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
+                },
+                Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
+            }
+        }
         UiEvent::HotkeyRegistrationFailed { error, .. } => warn!("{error}"),
         UiEvent::EscapeRegistrationFailed { error } => warn!("Escape hotkey unavailable: {error}"),
         UiEvent::PushToTalkHookFailed { error } => {
@@ -505,6 +513,7 @@ fn start_recording(
         }
     };
 
+    let level_meter = recorder.level_meter();
     let caret = target.caret;
     info!(
         "recording started; transcription mode={}; caret method={:?}",
@@ -521,6 +530,7 @@ fn start_recording(
     });
     *done_until = None;
     let _ = ui.send(UiCommand::SetRecording(true));
+    let _ = ui.send(UiCommand::SetLevelMeter(Some(level_meter)));
     play_cue(config.sound_cues, 0x40);
     update_timers(ui, active.as_mut(), done_until);
 }
@@ -546,6 +556,8 @@ fn stop_recording(
         Ok(captured) => captured,
         Err(error) => {
             let _ = ui.send(UiCommand::SetRecording(false));
+            let _ = ui.send(UiCommand::SetLevelMeter(None));
+            let _ = ui.send(UiCommand::SetTrayError(true));
             let _ = ui.hide_caret_anchor();
             show_notice(ui, "Scribetray recording", &error.to_string());
             play_cue(config.sound_cues, 0x10);
@@ -554,6 +566,7 @@ fn stop_recording(
     };
 
     let _ = ui.send(UiCommand::SetRecording(false));
+    let _ = ui.send(UiCommand::SetLevelMeter(None));
     play_cue(config.sound_cues, 0x40);
     match history.create_pending_pcm(&captured.pcm_16k_mono, captured.duration_seconds) {
         Ok(recording) => {
@@ -592,6 +605,7 @@ fn stop_recording(
         }
         Err(error) => {
             let _ = ui.hide_caret_anchor();
+            let _ = ui.send(UiCommand::SetTrayError(true));
             show_notice(ui, "Scribetray history", &error.to_string());
         }
     }
@@ -613,8 +627,17 @@ fn start_streaming_transcription(
     submit_after_transcription: &mut HashMap<String, bool>,
 ) {
     let id = recording.id;
+    if deliveries.contains_key(&id) {
+        show_notice(
+            ui,
+            "Scribetray history",
+            "This recording is already being transcribed.",
+        );
+        return;
+    }
     deliveries.insert(id.clone(), delivery);
     submit_after_transcription.insert(id.clone(), enter_after);
+    let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
 
     let sender = worker_tx.clone();
     let api_key = config.resolved_api_key();
@@ -652,8 +675,11 @@ fn start_streaming_transcription(
         });
 
     if let Err(error) = task {
+        set_anchor_error(ui, deliveries.get(&id));
         deliveries.remove(&id);
         submit_after_transcription.remove(&id);
+        let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
+        let _ = ui.send(UiCommand::SetTrayError(true));
         let _ = history.mark_failed(&id, "Could not start transcription worker");
         show_notice(
             ui,
@@ -678,8 +704,17 @@ fn start_transcription(
     submit_after_transcription: &mut HashMap<String, bool>,
 ) {
     let id = recording.id;
+    if deliveries.contains_key(&id) {
+        show_notice(
+            ui,
+            "Scribetray history",
+            "This recording is already being transcribed.",
+        );
+        return;
+    }
     deliveries.insert(id.clone(), delivery);
     submit_after_transcription.insert(id.clone(), enter_after);
+    let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
 
     let sender = worker_tx.clone();
     let api_key = config.resolved_api_key();
@@ -704,8 +739,11 @@ fn start_transcription(
         });
 
     if let Err(error) = task {
+        set_anchor_error(ui, deliveries.get(&id));
         deliveries.remove(&id);
         submit_after_transcription.remove(&id);
+        let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
+        let _ = ui.send(UiCommand::SetTrayError(true));
         let _ = history.mark_failed(&id, "Could not start transcription worker");
         show_notice(
             ui,
@@ -752,6 +790,7 @@ fn drain_worker_events(
                 );
             }
             Err(message) => {
+                let _ = ui.send(UiCommand::SetTrayError(true));
                 if let Err(error) = history.mark_failed(&finished.history_id, message.clone()) {
                     error!("could not save transcription error to history: {error}");
                 }
@@ -763,6 +802,7 @@ fn drain_worker_events(
                 play_cue(config.sound_cues, 0x10);
             }
         }
+        let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
         refresh_history_menu(ui, history);
     }
 }
@@ -778,6 +818,7 @@ fn complete_transcription(
 ) {
     let mut text = transcription.text;
     if text.trim().is_empty() {
+        let _ = ui.send(UiCommand::SetTrayError(true));
         set_anchor_error(ui, delivery.as_ref());
         if !recording_active {
             *done_until = Some(Instant::now() + DONE_DISPLAY);
@@ -802,6 +843,7 @@ fn complete_transcription(
             };
             match wininput::insert_text(&target, &text, method, config.restore_clipboard) {
                 Ok(()) => {
+                    let _ = ui.send(UiCommand::SetTrayError(false));
                     if enter_after || config.auto_enter {
                         thread::sleep(Duration::from_millis(80));
                         if let Err(error) = wininput::send_enter(&target) {
@@ -823,6 +865,7 @@ fn complete_transcription(
                     play_cue(config.sound_cues, 0x40);
                 }
                 Err(error) => {
+                    let _ = ui.send(UiCommand::SetTrayError(true));
                     match wininput::copy_text(&text) {
                         Ok(()) => show_notice(
                             ui,
@@ -849,16 +892,22 @@ fn complete_transcription(
         }
         Some(Delivery::Clipboard) | None => {
             match wininput::copy_text(&text) {
-                Ok(()) => show_notice(
-                    ui,
-                    "Scribetray history",
-                    "Transcription ready and copied to clipboard.",
-                ),
-                Err(error) => show_notice(
-                    ui,
-                    "Scribetray history",
-                    &format!("Could not copy transcription: {error}"),
-                ),
+                Ok(()) => {
+                    let _ = ui.send(UiCommand::SetTrayError(false));
+                    show_notice(
+                        ui,
+                        "Scribetray history",
+                        "Transcription ready and copied to clipboard.",
+                    )
+                }
+                Err(error) => {
+                    let _ = ui.send(UiCommand::SetTrayError(true));
+                    show_notice(
+                        ui,
+                        "Scribetray history",
+                        &format!("Could not copy transcription: {error}"),
+                    )
+                }
             }
             if !recording_active {
                 let _ = ui.hide_caret_anchor();
@@ -956,6 +1005,7 @@ fn make_ui_settings(
         submit_hotkey,
         push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
         realtime_enabled: config.realtime,
+        api_key_configured: config.resolved_api_key().is_some(),
         selected_microphone: config.microphone.clone(),
         microphones,
         prefix_enabled: config.prefix_enabled,
@@ -1001,13 +1051,23 @@ fn validate_config(config: &Config) -> Result<(), String> {
 fn history_label(recording: &Recording) -> String {
     let minutes = recording.duration_seconds / 60;
     let seconds = recording.duration_seconds % 60;
-    let status = match recording.status {
-        RecordingStatus::Pending => " — Pending",
-        RecordingStatus::Succeeded => "",
-        RecordingStatus::Failed => " — Failed",
+    let summary = match recording.transcript.as_deref() {
+        Some(transcript) if !transcript.trim().is_empty() => {
+            let normalized = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut preview: String = normalized.chars().take(40).collect();
+            if normalized.chars().count() > 40 {
+                preview.push('…');
+            }
+            preview
+        }
+        _ => match recording.status {
+            RecordingStatus::Pending => "Pending…".to_owned(),
+            RecordingStatus::Succeeded => "No transcript".to_owned(),
+            RecordingStatus::Failed => "Failed — click to retry".to_owned(),
+        },
     };
     format!(
-        "{} · {minutes:02}:{seconds:02}{status}",
+        "{} · {minutes:02}:{seconds:02} · {summary}",
         history_timestamp_label(recording.timestamp_ms)
     )
 }
