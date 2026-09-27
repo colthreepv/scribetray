@@ -565,6 +565,7 @@ fn wait_for_hotkey_release() -> Result<()> {
         VK_RSHIFT,
         VK_LCONTROL,
         VK_RCONTROL,
+        VK_RETURN,
     ];
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {

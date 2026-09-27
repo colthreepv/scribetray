@@ -20,11 +20,12 @@ under `%LOCALAPPDATA%\Scribetray`.
 
 ## Use
 
-- **Win+Alt+V** starts or stops recording. **Esc** cancels the current
+- **Win+Alt+V** starts or stops recording. While recording, **Enter** stops,
+  inserts the transcript, and submits it once. **Esc** cancels the current
   recording. The tray menu can switch to push-to-talk, where holding the
   configured toggle chord records until you release it.
-- **Win+Alt+Shift+V** records and submits with Enter.
-- Clicking the system-tray icon opens the menu; it does not start recording.
+- Left-clicking the system-tray icon copies the newest recoverable dictation;
+  right-click opens the full menu.
 - The tray menu can capture a new toggle hotkey and controls push-to-talk,
   realtime transcription, microphone selection, the emoji prefix, Auto-Enter,
   sound cues, typing mode, language, Start with Windows, and recording history.
@@ -34,9 +35,9 @@ under `%LOCALAPPDATA%\Scribetray`.
   and Shift modifiers.
 - Failed uploads keep the PCM recording in history for retry. A focus change
   before insertion sends the transcript to the clipboard instead.
-- History entries show the local date and recording duration. Successful entries
-  include a short transcript preview; pending and failed entries keep their
-  status. There is no redundant “Done” label.
+- History lists the 10 newest recoverable dictations with a transcript preview
+  and duration. A warning marks text that was copied instead of inserted;
+  failed recordings can be retried, and pending recordings are grayed out.
 - While recording, a compact non-activating pill follows the caret. Its waveform
   reacts to the live microphone level; the tray icon and tooltip show recording,
   transcription, setup, and error states.
@@ -60,7 +61,6 @@ Example settings:
 
 ```toml
 hotkey = "Win+Alt+V"
-hotkey_submit = "Win+Alt+Shift+V"
 mode = "toggle" # or "push_to_talk"
 realtime = false
 keyterms = []
@@ -70,9 +70,10 @@ insert_method = "type" # or "paste"
 ## Versioning
 
 Release versions follow the implementation milestones: M0 was a disposable
-spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, and M3 to `v0.3.x`. The current
-build is `v0.3.0`; patch numbers increase for fixes within the current
-milestone. The tray tooltip shows the running version.
+spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, and the recovery
+and send refresh is `v0.4.x`. The current build is `v0.4.0`; patch numbers
+increase for fixes within the current milestone. The tray tooltip shows the
+running version.
 
 Scribetray is a per-user desktop application and needs no installer or
 administrator rights. It can run directly from this repository's
@@ -84,15 +85,17 @@ tray icon, global hotkeys, microphone, and text-field insertion.
 
 ## Implementation status
 
-The Rust application builds for `x86_64-pc-windows-msvc`; the M1/M2 startup log
-confirms registration of the default recording and submit hotkeys. The user
-has confirmed a realtime recording, transcription, and insertion round-trip in
-Codex App. Push-to-talk and the full target-app matrix still need a manual pass.
+The Rust application builds for `x86_64-pc-windows-msvc`; the UI registers the
+configured recording hotkey and registers Enter and Esc only while recording.
+The user has confirmed a realtime recording, transcription, and insertion
+round-trip in Codex App. Push-to-talk and the full target-app matrix still need
+a manual pass.
 The app includes
 WASAPI-backed capture through CPAL, batch and realtime Scribe transcription,
 push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
 clipboard-preserving paste, guarded Unicode typing, local history, retry,
-language selection, optional Enter, and per-user autostart.
+language selection, Enter-to-send while recording, optional Auto-Enter on stop,
+and per-user autostart.
 
 Earlier Codex App logs reported the mouse-position fallback; updated runs have
 reported both UIA `TextPattern` caret detection and mouse fallback. The user
@@ -114,5 +117,6 @@ The latest desktop feedback reports that message-beep sound cues were inaudible,
 and that Paste mode can leave the clipboard replaced and skip Auto-Enter. The
 app now uses embedded WAV cues and restores the saved clipboard when the
 temporary transcript is still present, while preserving newer clipboard data.
-Left-click on the tray icon opens the menu. Sound output and Chrome Paste-mode
-Auto-Enter still need a retest with the updated executable.
+Right-click opens the tray menu; left-click copies or retries the newest
+recoverable dictation. Sound output and Chrome Paste-mode Auto-Enter still need
+a retest with the updated executable.

@@ -19,7 +19,7 @@ use std::{
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
 };
-use tracing::info;
+use tracing::{info, warn};
 use windows::{
     Win32::{
         Foundation::{
@@ -38,7 +38,7 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{
                 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-                UnregisterHotKey, VK_ESCAPE,
+                UnregisterHotKey, VK_ESCAPE, VK_RETURN,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
@@ -72,8 +72,8 @@ const TRAY_ICON_ID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const WAKE_COMMANDS: u32 = WM_APP + 2;
 const HOTKEY_TOGGLE_ID: i32 = 0x5343;
-const HOTKEY_SUBMIT_ID: i32 = 0x5344;
 const HOTKEY_ESCAPE_ID: i32 = 0x5345;
+const HOTKEY_ENTER_ID: i32 = 0x5346;
 /// Ticks the tray tooltip once per second while recording.
 const TIMER_RECORDING: usize = 0x5343;
 /// Advances the caret overlay animation while it is visible.
@@ -86,6 +86,7 @@ const OVERLAY_RECORDING_TICK_MS: u32 = 1000;
 
 /// Caret overlay geometry in device-independent pixels, scaled per monitor.
 const PILL_WIDTH_DIP: f32 = 58.0;
+const PILL_COUNTDOWN_WIDTH_DIP: f32 = 90.0;
 const PILL_HEIGHT_DIP: f32 = 22.0;
 const PILL_RADIUS_DIP: f32 = 11.0;
 /// Transparent margin around the pill that carries the soft shadow.
@@ -291,8 +292,8 @@ pub struct HistoryMenuItem {
 #[derive(Clone, Debug)]
 pub struct UiSettings {
     pub toggle_hotkey: Hotkey,
-    pub submit_hotkey: Hotkey,
     pub push_to_talk: bool,
+    pub max_seconds: u32,
     pub realtime_enabled: bool,
     /// Whether an ElevenLabs API key is resolved from the environment or config.
     pub api_key_configured: bool,
@@ -312,12 +313,8 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             toggle_hotkey: Hotkey::default(),
-            submit_hotkey: Hotkey::with_modifiers(
-                b'V' as u32,
-                "V",
-                HotkeyModifiers::new(true, false),
-            ),
             push_to_talk: false,
+            max_seconds: 600,
             realtime_enabled: false,
             api_key_configured: false,
             selected_microphone: None,
@@ -372,14 +369,14 @@ pub enum AnchorStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyPurpose {
     ToggleRecording,
-    SubmitRecording,
 }
 
 /// Actions initiated by the user through the tray or registered hotkeys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
     ToggleRecord,
-    SubmitHotkeyRecord,
+    EnterPressed,
+    RecoverLast,
     PushToTalkPressed,
     PushToTalkReleased,
     CancelRecord,
@@ -524,8 +521,8 @@ struct UiState {
     tray_theme: TrayTheme,
     tray_tooltip: String,
     toggle_registered: bool,
-    submit_registered: bool,
     escape_registered: bool,
+    enter_registered: bool,
     recording: bool,
     shutting_down: bool,
     anchor_rect: Option<CaretRect>,
@@ -658,8 +655,8 @@ fn create_ui_state(
         overlay_shown_at: Instant::now(),
         overlay_state_since: Instant::now(),
         toggle_registered: false,
-        submit_registered: false,
         escape_registered: false,
+        enter_registered: false,
         recording: false,
         shutting_down: false,
         anchor_rect: None,
@@ -701,7 +698,7 @@ fn create_ui_state(
             WS_POPUP,
             0,
             0,
-            overlay_window_width(1.0),
+            overlay_window_width(1.0, false),
             overlay_window_height(1.0),
             None,
             None,
@@ -744,7 +741,6 @@ impl UiState {
     fn register_hotkeys(&mut self) {
         self.unregister_record_hotkeys();
         let toggle = self.settings.toggle_hotkey.clone();
-        let submit = self.settings.submit_hotkey.clone();
         self.toggle_registered = if self.settings.push_to_talk {
             false
         } else {
@@ -754,21 +750,6 @@ impl UiState {
                 toggle.clone(),
             )
         };
-
-        if toggle.virtual_key == submit.virtual_key && toggle.modifiers == submit.modifiers {
-            self.hotkey_failure(
-                HotkeyPurpose::SubmitRecording,
-                submit,
-                "the submit hotkey matches the toggle hotkey".to_owned(),
-            );
-            self.submit_registered = false;
-        } else {
-            self.submit_registered = self.register_record_hotkey(
-                HOTKEY_SUBMIT_ID,
-                HotkeyPurpose::SubmitRecording,
-                submit,
-            );
-        }
     }
 
     fn register_record_hotkey(&mut self, id: i32, purpose: HotkeyPurpose, hotkey: Hotkey) -> bool {
@@ -794,7 +775,6 @@ impl UiState {
     fn hotkey_failure(&self, purpose: HotkeyPurpose, hotkey: Hotkey, error: String) {
         let purpose_label = match purpose {
             HotkeyPurpose::ToggleRecording => "record toggle",
-            HotkeyPurpose::SubmitRecording => "record submit",
         };
         let details = format!(
             "Could not register {purpose_label} hotkey {}: {error}. Choose another key in settings.",
@@ -813,10 +793,6 @@ impl UiState {
             let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_TOGGLE_ID) };
             self.toggle_registered = false;
         }
-        if self.submit_registered {
-            let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_SUBMIT_ID) };
-            self.submit_registered = false;
-        }
     }
 
     fn set_recording(&mut self, recording: bool) {
@@ -824,8 +800,12 @@ impl UiState {
             return;
         }
         self.recording = recording;
+        PUSH_TO_TALK_HOOK_STATE.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                state.recording = recording;
+            }
+        });
         if recording {
-            self.tray_error = false;
             match unsafe {
                 RegisterHotKey(
                     Some(self.tray_hwnd),
@@ -848,6 +828,23 @@ impl UiState {
                     self.show_notice(TITLE, &message);
                 }
             }
+            match unsafe {
+                RegisterHotKey(
+                    Some(self.tray_hwnd),
+                    HOTKEY_ENTER_ID,
+                    MOD_NOREPEAT,
+                    VK_RETURN.0 as u32,
+                )
+            } {
+                Ok(()) => {
+                    self.enter_registered = true;
+                    info!("registered Enter to stop and send");
+                }
+                Err(error) => {
+                    self.enter_registered = false;
+                    warn!("could not register Enter to stop and send: {error}");
+                }
+            }
         } else {
             self.unregister_escape();
         }
@@ -858,13 +855,16 @@ impl UiState {
             let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ESCAPE_ID) };
             self.escape_registered = false;
         }
+        if self.enter_registered {
+            let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ENTER_ID) };
+            self.enter_registered = false;
+        }
     }
 
     fn apply_command(&mut self, command: UiCommand) {
         match command {
             UiCommand::SetSettings(settings) => {
-                let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey
-                    || self.settings.submit_hotkey != settings.submit_hotkey;
+                let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
                 self.settings = settings;
                 if hotkeys_changed || mode_changed {
@@ -889,7 +889,11 @@ impl UiState {
                 self.refresh_tray();
             }
             UiCommand::SetTrayError(error) => {
-                self.tray_error = error;
+                if error {
+                    self.tray_error = true;
+                } else {
+                    self.clear_tray_error();
+                }
                 self.refresh_tray();
             }
             UiCommand::UpdateAnchor { rect, status } => {
@@ -989,14 +993,15 @@ impl UiState {
             return;
         };
         let scale = self.overlay_dpi_scale.max(0.5);
-        let (left, top) = overlay_window_position(rect, scale);
+        let expanded = overlay_countdown(self).is_some();
+        let (left, top) = overlay_window_position(rect, scale, expanded);
         unsafe {
             let _ = SetWindowPos(
                 self.overlay_hwnd,
                 Some(HWND_TOPMOST),
                 left,
                 top,
-                overlay_window_width(scale),
+                overlay_window_width(scale, expanded),
                 overlay_window_height(scale),
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
             );
@@ -1044,7 +1049,7 @@ impl UiState {
             return;
         }
         let scale = self.overlay_dpi_scale.max(0.5);
-        let width = overlay_window_width(scale).max(1) as u32;
+        let width = overlay_window_width(scale, overlay_countdown(self).is_some()).max(1) as u32;
         let height = overlay_window_height(scale).max(1) as u32;
         let Some(mut pixmap) = Pixmap::new(width, height) else {
             return;
@@ -1141,6 +1146,13 @@ impl UiState {
         data
     }
 
+    fn clear_tray_error(&mut self) {
+        self.tray_error = false;
+        if matches!(self.anchor_status, Some(AnchorStatus::Error)) {
+            self.hide_anchor();
+        }
+    }
+
     fn show_notice(&self, title: &str, message: &str) {
         let mut data = NOTIFYICONDATAW::default();
         data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -1154,6 +1166,8 @@ impl UiState {
     }
 
     fn show_menu(&mut self) {
+        self.clear_tray_error();
+        self.refresh_tray();
         let (menu, actions) = match build_tray_menu(&self.settings, self.recording) {
             Ok(menu) => menu,
             Err(error) => {
@@ -1253,6 +1267,8 @@ impl UiState {
                         state.hotkey = self.settings.toggle_hotkey.clone();
                         state.engaged = false;
                         state.pressed_modifiers = 0;
+                        state.enter_pressed = false;
+                        state.recording = false;
                     }
                 });
                 return;
@@ -1264,6 +1280,8 @@ impl UiState {
                     hotkey: self.settings.toggle_hotkey.clone(),
                     pressed_modifiers: 0,
                     engaged: false,
+                    enter_pressed: false,
+                    recording: self.recording,
                 });
             });
             match unsafe {
@@ -1304,6 +1322,8 @@ struct PushToTalkHookState {
     hotkey: Hotkey,
     pressed_modifiers: u8,
     engaged: bool,
+    enter_pressed: bool,
+    recording: bool,
 }
 
 unsafe extern "system" fn push_to_talk_keyboard_hook(
@@ -1337,8 +1357,18 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
             }
         }
 
+        let is_enter_key = keyboard.vkCode == VK_RETURN.0 as u32;
         let is_trigger_key = keyboard.vkCode == state.hotkey.virtual_key;
-        if key_down && is_trigger_key {
+        if key_down && is_enter_key && state.engaged && state.recording {
+            if !state.enter_pressed {
+                state.enter_pressed = true;
+                swallow = true;
+                let _ = state.events.send(UiEvent::EnterPressed);
+            }
+        } else if key_up && is_enter_key && state.enter_pressed {
+            state.enter_pressed = false;
+            swallow = true;
+        } else if key_down && is_trigger_key {
             if state.engaged {
                 swallow = true;
             } else if modifiers_match(state) {
@@ -1414,6 +1444,15 @@ fn overlay_kind(status: AnchorStatus) -> OverlayKind {
     }
 }
 
+fn overlay_countdown(state: &UiState) -> Option<u32> {
+    let Some(AnchorStatus::Recording { elapsed }) = state.anchor_status else {
+        return None;
+    };
+    let elapsed = elapsed.as_secs().min(u32::MAX as u64) as u32;
+    let remaining = state.settings.max_seconds.saturating_sub(elapsed);
+    (remaining <= 60).then_some(remaining)
+}
+
 /// Monitor that contains the caret, falling back to the nearest one.
 fn caret_monitor(caret: CaretRect) -> Option<windows::Win32::Graphics::Gdi::HMONITOR> {
     let rect = RECT {
@@ -1456,8 +1495,13 @@ fn caret_work_area(caret: CaretRect) -> Option<RECT> {
     }
 }
 
-fn overlay_window_width(scale: f32) -> i32 {
-    ((PILL_WIDTH_DIP + OVERLAY_SHADOW_PAD_DIP * 2.0) * scale)
+fn overlay_window_width(scale: f32, expanded: bool) -> i32 {
+    let pill_width = if expanded {
+        PILL_COUNTDOWN_WIDTH_DIP
+    } else {
+        PILL_WIDTH_DIP
+    };
+    ((pill_width + OVERLAY_SHADOW_PAD_DIP * 2.0) * scale)
         .round()
         .max(1.0) as i32
 }
@@ -1470,8 +1514,8 @@ fn overlay_window_height(scale: f32) -> i32 {
 
 /// Places the pill above the caret, flipping below and clamping into the work
 /// area when the caret sits close to a screen edge.
-fn overlay_window_position(caret: CaretRect, scale: f32) -> (i32, i32) {
-    let window_width = overlay_window_width(scale);
+fn overlay_window_position(caret: CaretRect, scale: f32, expanded: bool) -> (i32, i32) {
+    let window_width = overlay_window_width(scale, expanded);
     let window_height = overlay_window_height(scale);
     let pad = (OVERLAY_SHADOW_PAD_DIP * scale).round() as i32;
     let gap = (OVERLAY_GAP_DIP * scale).round() as i32;
@@ -1521,9 +1565,8 @@ fn build_tray_menu(
     let mut next_dynamic_id = 100_u32;
     let setup_ready = settings.api_key_configured;
     let toggle_label = settings.toggle_hotkey.combo_label();
-    let submit_label = settings.submit_hotkey.combo_label();
 
-    // The first item is the default item, matching what a plain left-click uses.
+    // The first item is the default action when the full menu opens.
     let default_id;
     if setup_ready {
         default_id = 1;
@@ -1541,13 +1584,6 @@ fn build_tray_menu(
             UiEvent::ToggleRecord,
             &mut actions,
         )?;
-        append_action(
-            root.0,
-            &format!("Record and send\t{submit_label}"),
-            2,
-            UiEvent::SubmitHotkeyRecord,
-            &mut actions,
-        )?;
     } else {
         // Nothing can record until an API key exists; make that the primary action.
         default_id = 3;
@@ -1563,12 +1599,6 @@ fn build_tray_menu(
             MF_GRAYED,
             0,
             &format!("Start recording\t{toggle_label}"),
-        )?;
-        append_flags(
-            root.0,
-            MF_GRAYED,
-            0,
-            &format!("Record and send\t{submit_label}"),
         )?;
     }
     append_separator(root.0)?;
@@ -1637,7 +1667,7 @@ fn build_tray_menu(
             } else if item.can_retry {
                 append_action(
                     history_menu.0,
-                    &truncate_menu_label(&format!("⚠ {}", item.label)),
+                    &truncate_menu_label(&item.label),
                     id,
                     UiEvent::HistoryRetry(item.id.clone()),
                     &mut actions,
@@ -1915,6 +1945,8 @@ unsafe extern "system" fn window_proc(
             }
             WM_TIMER if wparam.0 == TIMER_RECORDING => {
                 // Refresh the elapsed-time tooltip; the animation timer repaints.
+                state.reposition_overlay();
+                state.render_overlay();
                 state.refresh_tray();
                 return LRESULT(0);
             }
@@ -1931,7 +1963,8 @@ unsafe extern "system" fn window_proc(
     } else {
         if message == TRAY_CALLBACK {
             match lparam.0 as u32 & 0xffff {
-                WM_RBUTTONUP | WM_CONTEXTMENU | WM_LBUTTONUP | NIN_SELECT => state.show_menu(),
+                WM_RBUTTONUP | WM_CONTEXTMENU => state.show_menu(),
+                WM_LBUTTONUP | NIN_SELECT => state.handle_user_event(UiEvent::RecoverLast),
                 _ => {}
             }
             return LRESULT(0);
@@ -1955,10 +1988,15 @@ unsafe extern "system" fn window_proc(
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE_ID => state.handle_user_event(UiEvent::ToggleRecord),
-                    HOTKEY_SUBMIT_ID => state.handle_user_event(UiEvent::SubmitHotkeyRecord),
+                    HOTKEY_ENTER_ID => state.handle_user_event(UiEvent::EnterPressed),
                     HOTKEY_ESCAPE_ID => {
                         state.unregister_escape();
                         state.recording = false;
+                        PUSH_TO_TALK_HOOK_STATE.with(|hook_state| {
+                            if let Some(hook_state) = hook_state.borrow_mut().as_mut() {
+                                hook_state.recording = false;
+                            }
+                        });
                         state.handle_user_event(UiEvent::CancelRecord);
                     }
                     _ => {}
@@ -1989,7 +2027,12 @@ unsafe extern "system" fn window_proc(
 /// prototype's device-independent pixels and multiplied by the scale factor.
 fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
     let pad = OVERLAY_SHADOW_PAD_DIP * scale;
-    let pill_width = PILL_WIDTH_DIP * scale;
+    let countdown = overlay_countdown(state);
+    let pill_width = if countdown.is_some() {
+        PILL_COUNTDOWN_WIDTH_DIP * scale
+    } else {
+        PILL_WIDTH_DIP * scale
+    };
     let pill_height = PILL_HEIGHT_DIP * scale;
     let radius = PILL_RADIUS_DIP * scale;
     let center_y = pad + pill_height / 2.0;
@@ -2104,6 +2147,9 @@ fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
                     fill_path(pixmap, &path, bar_color(alpha));
                 }
             }
+            if let Some(remaining) = countdown {
+                draw_countdown(pixmap, remaining, pad, pill_width, center_y, scale, alpha);
+            }
         }
         Some(OverlayKind::Working) => {
             let dot_x = pad + OVERLAY_DOT_X_DIP * scale;
@@ -2122,6 +2168,76 @@ fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
             }
         }
         _ => {}
+    }
+}
+
+fn draw_countdown(
+    pixmap: &mut Pixmap,
+    remaining: u32,
+    pad: f32,
+    pill_width: f32,
+    center_y: f32,
+    scale: f32,
+    alpha: f32,
+) {
+    let text = format!("{}:{:02}", remaining / 60, remaining % 60);
+    let text_width: f32 = text
+        .chars()
+        .map(|character| if character == ':' { 4.5 } else { 7.0 })
+        .sum::<f32>()
+        * scale;
+    let mut x = pad + pill_width - 6.0 * scale - text_width;
+    let y = center_y - 4.0 * scale;
+    let color = work_color(alpha);
+    let stroke = 1.2 * scale;
+    const DIGIT_SEGMENTS: [u8; 10] = [
+        0b011_1111, // 0
+        0b000_0110, // 1
+        0b101_1011, // 2
+        0b100_1111, // 3
+        0b110_0110, // 4
+        0b110_1101, // 5
+        0b111_1101, // 6
+        0b000_0111, // 7
+        0b111_1111, // 8
+        0b110_1111, // 9
+    ];
+    const SEGMENTS: [(f32, f32, f32, f32); 7] = [
+        (1.0, 0.0, 4.0, 0.0),
+        (4.5, 0.5, 4.5, 3.5),
+        (4.5, 4.5, 4.5, 7.5),
+        (1.0, 8.0, 4.0, 8.0),
+        (0.5, 4.5, 0.5, 7.5),
+        (0.5, 0.5, 0.5, 3.5),
+        (1.0, 4.0, 4.0, 4.0),
+    ];
+
+    for character in text.chars() {
+        if character == ':' {
+            for offset in [2.5, 5.5] {
+                if let Some(path) = circle_path(x + scale, y + offset * scale, 0.65 * scale) {
+                    fill_path(pixmap, &path, color);
+                }
+            }
+            x += 4.5 * scale;
+            continue;
+        }
+
+        let mask = DIGIT_SEGMENTS[character.to_digit(10).unwrap_or(0) as usize];
+        for (index, (x1, y1, x2, y2)) in SEGMENTS.iter().enumerate() {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            if let Some(path) = line_path(
+                x + x1 * scale,
+                y + y1 * scale,
+                x + x2 * scale,
+                y + y2 * scale,
+            ) {
+                stroke_path(pixmap, &path, color, stroke);
+            }
+        }
+        x += 7.0 * scale;
     }
 }
 
@@ -2469,11 +2585,14 @@ fn tray_tooltip_text(
 ) -> String {
     let version = env!("CARGO_PKG_VERSION");
     match state {
-        TrayState::Idle => format!("Scribetray {version} — Ready ({})", hotkey.combo_label()),
+        TrayState::Idle => format!(
+            "Scribetray {version} — Ready ({}) · click: copy last dictation",
+            hotkey.combo_label()
+        ),
         TrayState::Recording => {
             let total = elapsed.unwrap_or_default().as_secs();
             format!(
-                "Scribetray {version} — Recording {:02}:{:02} · Esc to cancel",
+                "Scribetray {version} — Recording {:02}:{:02} · Enter to send · Esc to cancel",
                 (total / 60) % 100,
                 total % 60
             )

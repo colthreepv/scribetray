@@ -32,11 +32,7 @@ use history::{History, Recording, RecordingStatus};
 use scribe::{ScribeClient, Transcription};
 use tracing::{error, info, warn};
 use windows::{
-    Win32::{
-        Foundation::{FILETIME, SYSTEMTIME},
-        Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
-        System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
-    },
+    Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
     core::PCWSTR,
 };
 use windows_ui::{
@@ -70,7 +66,6 @@ struct ActiveRecording {
     target: TargetSnapshot,
     started: Instant,
     next_caret_refresh: Instant,
-    submit_on_complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,10 +252,10 @@ fn handle_ui_event(
                     submit_after_transcription,
                 );
             } else {
-                start_recording(active, false, config, ui, done_until);
+                start_recording(active, config, ui, done_until);
             }
         }
-        UiEvent::SubmitHotkeyRecord => {
+        UiEvent::EnterPressed => {
             if active.is_some() {
                 stop_recording(
                     active,
@@ -272,13 +267,21 @@ fn handle_ui_event(
                     deliveries,
                     submit_after_transcription,
                 );
-            } else {
-                start_recording(active, true, config, ui, done_until);
             }
+        }
+        UiEvent::RecoverLast => {
+            recover_last_dictation(
+                config,
+                ui,
+                history,
+                worker_tx,
+                deliveries,
+                submit_after_transcription,
+            );
         }
         UiEvent::PushToTalkPressed => {
             if active.is_none() {
-                start_recording(active, false, config, ui, done_until);
+                start_recording(active, config, ui, done_until);
             }
         }
         UiEvent::PushToTalkReleased => {
@@ -434,9 +437,85 @@ fn handle_ui_event(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn recover_last_dictation(
+    config: &Config,
+    ui: &UiRuntime,
+    history: &History,
+    worker_tx: &Sender<WorkerFinished>,
+    deliveries: &mut HashMap<String, Delivery>,
+    submit_after_transcription: &mut HashMap<String, bool>,
+) {
+    let _ = ui.send(UiCommand::SetTrayError(false));
+    let recordings = match history.list() {
+        Ok(recordings) => recordings,
+        Err(error) => {
+            show_notice(ui, "Scribetray history", &error.to_string());
+            return;
+        }
+    };
+    let Some(recording) = recordings.into_iter().find(history_item_visible) else {
+        show_notice(ui, "Scribetray history", "Nothing to recover yet");
+        return;
+    };
+
+    match recording.status {
+        RecordingStatus::Pending => {
+            show_notice(ui, "Scribetray history", "Still transcribing…");
+        }
+        RecordingStatus::Failed => match history.read_audio(&recording.id) {
+            Ok(pcm) => {
+                show_notice(
+                    ui,
+                    "Scribetray history",
+                    &format!("Retrying {}…", format_duration(recording.duration_seconds)),
+                );
+                start_transcription(
+                    recording,
+                    pcm,
+                    Delivery::Clipboard,
+                    false,
+                    config,
+                    ui,
+                    history,
+                    worker_tx,
+                    deliveries,
+                    submit_after_transcription,
+                );
+            }
+            Err(error) => show_notice(ui, "Scribetray history", &error.to_string()),
+        },
+        RecordingStatus::Succeeded => {
+            let Some(transcript) = recording
+                .transcript
+                .as_deref()
+                .filter(|transcript| !transcript.trim().is_empty())
+            else {
+                show_notice(ui, "Scribetray history", "Nothing to recover yet");
+                return;
+            };
+            match wininput::copy_text(transcript) {
+                Ok(()) => show_notice(
+                    ui,
+                    "Scribetray history",
+                    &format!(
+                        "Copied: \"{}\" · {}",
+                        history_preview(transcript),
+                        format_duration(recording.duration_seconds)
+                    ),
+                ),
+                Err(error) => show_notice(
+                    ui,
+                    "Scribetray history",
+                    &format!("Could not copy transcript: {error}"),
+                ),
+            }
+        }
+    }
+}
+
 fn start_recording(
     active: &mut Option<ActiveRecording>,
-    submit_on_complete: bool,
     config: &Config,
     ui: &UiRuntime,
     done_until: &mut Option<Instant>,
@@ -526,7 +605,6 @@ fn start_recording(
         target,
         started: Instant::now(),
         next_caret_refresh: Instant::now(),
-        submit_on_complete,
     });
     *done_until = None;
     let _ = ui.send(UiCommand::SetRecording(true));
@@ -538,7 +616,7 @@ fn start_recording(
 #[allow(clippy::too_many_arguments)]
 fn stop_recording(
     active: &mut Option<ActiveRecording>,
-    submit_hotkey: bool,
+    send_enter_after: bool,
     config: &Config,
     ui: &UiRuntime,
     history: &History,
@@ -551,7 +629,7 @@ fn stop_recording(
     };
     let target = active_recording.target;
     let realtime_result = active_recording.realtime_result;
-    let enter_after = active_recording.submit_on_complete || submit_hotkey;
+    let enter_after = send_enter_after;
     let captured = match active_recording.recorder.stop() {
         Ok(captured) => captured,
         Err(error) => {
@@ -635,6 +713,9 @@ fn start_streaming_transcription(
         );
         return;
     }
+    if let Err(error) = history.mark_pending(&id) {
+        warn!("could not mark retry as pending: {error}");
+    }
     deliveries.insert(id.clone(), delivery);
     submit_after_transcription.insert(id.clone(), enter_after);
     let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
@@ -712,6 +793,9 @@ fn start_transcription(
         );
         return;
     }
+    if let Err(error) = history.mark_pending(&id) {
+        warn!("could not mark retry as pending: {error}");
+    }
     deliveries.insert(id.clone(), delivery);
     submit_after_transcription.insert(id.clone(), enter_after);
     let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
@@ -783,6 +867,8 @@ fn drain_worker_events(
                     transcription,
                     delivery,
                     enter_after,
+                    history,
+                    &finished.history_id,
                     config,
                     ui,
                     recording_active,
@@ -811,6 +897,8 @@ fn complete_transcription(
     transcription: Transcription,
     delivery: Option<Delivery>,
     enter_after: bool,
+    history: &History,
+    history_id: &str,
     config: &Config,
     ui: &UiRuntime,
     recording_active: bool,
@@ -843,6 +931,7 @@ fn complete_transcription(
             };
             match wininput::insert_text(&target, &text, method, config.restore_clipboard) {
                 Ok(()) => {
+                    mark_history_delivery(history, history_id, true);
                     let _ = ui.send(UiCommand::SetTrayError(false));
                     if enter_after || config.auto_enter {
                         thread::sleep(Duration::from_millis(80));
@@ -865,6 +954,7 @@ fn complete_transcription(
                     play_cue(config.sound_cues, 0x40);
                 }
                 Err(error) => {
+                    mark_history_delivery(history, history_id, false);
                     let _ = ui.send(UiCommand::SetTrayError(true));
                     match wininput::copy_text(&text) {
                         Ok(()) => show_notice(
@@ -891,6 +981,7 @@ fn complete_transcription(
             }
         }
         Some(Delivery::Clipboard) | None => {
+            mark_history_delivery(history, history_id, false);
             match wininput::copy_text(&text) {
                 Ok(()) => {
                     let _ = ui.send(UiCommand::SetTrayError(false));
@@ -970,9 +1061,6 @@ fn make_ui_settings(
     microphones: Vec<String>,
 ) -> UiSettings {
     let toggle_hotkey = parse_hotkey(&config.hotkey).unwrap_or_default();
-    let submit_hotkey = parse_hotkey(&config.hotkey_submit).unwrap_or_else(|_| {
-        Hotkey::with_modifiers(b'V' as u32, "V", HotkeyModifiers::new(true, false))
-    });
     let languages = [
         ("auto", "Automatic detection"),
         ("en", "English"),
@@ -992,18 +1080,23 @@ fn make_ui_settings(
     .collect();
     let history = recordings
         .into_iter()
-        .take(history::MAX_RECORDINGS)
+        .filter(history_item_visible)
+        .take(10)
         .map(|recording| HistoryMenuItem {
             label: history_label(&recording),
             id: recording.id,
-            can_copy: recording.transcript.is_some(),
-            can_retry: recording.status != RecordingStatus::Succeeded,
+            can_copy: recording.status == RecordingStatus::Succeeded
+                && recording
+                    .transcript
+                    .as_deref()
+                    .is_some_and(|transcript| !transcript.trim().is_empty()),
+            can_retry: recording.status == RecordingStatus::Failed,
         })
         .collect();
     UiSettings {
         toggle_hotkey,
-        submit_hotkey,
         push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
+        max_seconds: config.max_seconds,
         realtime_enabled: config.realtime,
         api_key_configured: config.resolved_api_key().is_some(),
         selected_microphone: config.microphone.clone(),
@@ -1030,7 +1123,6 @@ fn config_stamp() -> Option<ConfigStamp> {
 
 fn validate_config(config: &Config) -> Result<(), String> {
     parse_hotkey(&config.hotkey)?;
-    parse_hotkey(&config.hotkey_submit)?;
     if config.max_seconds == 0 {
         return Err("max_seconds must be greater than zero".to_owned());
     }
@@ -1049,53 +1141,49 @@ fn validate_config(config: &Config) -> Result<(), String> {
 }
 
 fn history_label(recording: &Recording) -> String {
-    let minutes = recording.duration_seconds / 60;
-    let seconds = recording.duration_seconds % 60;
-    let summary = match recording.transcript.as_deref() {
-        Some(transcript) if !transcript.trim().is_empty() => {
-            let normalized = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
-            let mut preview: String = normalized.chars().take(40).collect();
-            if normalized.chars().count() > 40 {
-                preview.push('…');
+    let preview = match recording.status {
+        RecordingStatus::Pending => "Transcribing…".to_owned(),
+        RecordingStatus::Failed => "✕ Transcription failed — click to retry".to_owned(),
+        RecordingStatus::Succeeded => {
+            let text = recording.transcript.as_deref().unwrap_or_default();
+            let preview = history_preview(text);
+            if recording.delivered == Some(false) {
+                format!("⚠ {preview}")
+            } else {
+                preview
             }
-            preview
         }
-        _ => match recording.status {
-            RecordingStatus::Pending => "Pending…".to_owned(),
-            RecordingStatus::Succeeded => "No transcript".to_owned(),
-            RecordingStatus::Failed => "Failed — click to retry".to_owned(),
-        },
     };
-    format!(
-        "{} · {minutes:02}:{seconds:02} · {summary}",
-        history_timestamp_label(recording.timestamp_ms)
-    )
+    format!("{preview}\t{}", format_duration(recording.duration_seconds))
 }
 
-fn history_timestamp_label(timestamp_ms: u64) -> String {
-    const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
-    let Some(ticks) = timestamp_ms
-        .checked_mul(10_000)
-        .and_then(|ticks| ticks.checked_add(WINDOWS_EPOCH_OFFSET_100NS))
-    else {
-        return "Unknown date".to_owned();
-    };
-    let file_time = FILETIME {
-        dwLowDateTime: ticks as u32,
-        dwHighDateTime: (ticks >> 32) as u32,
-    };
-    let mut utc = SYSTEMTIME::default();
-    if unsafe { FileTimeToSystemTime(&file_time, &mut utc) }.is_err() {
-        return "Unknown date".to_owned();
+fn history_item_visible(recording: &Recording) -> bool {
+    match recording.status {
+        RecordingStatus::Pending | RecordingStatus::Failed => true,
+        RecordingStatus::Succeeded => recording
+            .transcript
+            .as_deref()
+            .is_some_and(|transcript| !transcript.trim().is_empty()),
     }
-    let mut local = SYSTEMTIME::default();
-    if unsafe { SystemTimeToTzSpecificLocalTime(None, &utc, &mut local) }.is_err() {
-        return "Unknown date".to_owned();
+}
+
+fn history_preview(transcript: &str) -> String {
+    let normalized = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = normalized.chars().take(40).collect();
+    if normalized.chars().count() > 40 {
+        preview.push('…');
     }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
-    )
+    preview
+}
+
+fn format_duration(seconds: u32) -> String {
+    format!("{:02}m{:02}s", seconds / 60, seconds % 60)
+}
+
+fn mark_history_delivery(history: &History, history_id: &str, delivered: bool) {
+    if let Err(error) = history.mark_delivered(history_id, delivered) {
+        error!("could not update dictation delivery state: {error}");
+    }
 }
 
 fn parse_hotkey(value: &str) -> Result<Hotkey, String> {

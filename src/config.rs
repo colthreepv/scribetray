@@ -30,8 +30,6 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Main global recording hotkey.
     pub hotkey: String,
-    /// Optional hotkey for submitting the current recording.
-    pub hotkey_submit: String,
     /// Recording interaction mode (for example, `toggle` or `push_to_talk`).
     pub mode: String,
     /// Stream audio to Scribe as it is recorded instead of using batch transcription.
@@ -63,7 +61,6 @@ impl fmt::Debug for Config {
             .debug_struct("Config")
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("hotkey", &self.hotkey)
-            .field("hotkey_submit", &self.hotkey_submit)
             .field("mode", &self.mode)
             .field("realtime", &self.realtime)
             .field("keyterms", &self.keyterms)
@@ -87,7 +84,6 @@ impl Default for Config {
         Self {
             api_key: None,
             hotkey: "Win+Alt+V".to_owned(),
-            hotkey_submit: "Win+Alt+Shift+V".to_owned(),
             mode: "toggle".to_owned(),
             realtime: false,
             keyterms: Vec::new(),

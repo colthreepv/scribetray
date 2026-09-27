@@ -44,6 +44,8 @@ pub struct Recording {
     pub duration_seconds: u32,
     pub status: RecordingStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_language: Option<String>,
@@ -119,6 +121,7 @@ impl History {
                 .min(u64::MAX as u128) as u64,
             duration_seconds,
             status: RecordingStatus::Pending,
+            delivered: None,
             transcript: None,
             detected_language: None,
             error: None,
@@ -203,6 +206,24 @@ impl History {
         recording.transcript = Some(transcript.into());
         recording.detected_language = detected_language;
         recording.error = None;
+        self.write_recording(&recording)?;
+        Ok(recording)
+    }
+
+    pub fn mark_delivered(&self, id: &str, delivered: bool) -> Result<Recording, HistoryError> {
+        let mut recording = self.get(id)?;
+        recording.delivered = Some(delivered);
+        self.write_recording(&recording)?;
+        Ok(recording)
+    }
+
+    pub fn mark_pending(&self, id: &str) -> Result<Recording, HistoryError> {
+        let mut recording = self.get(id)?;
+        recording.status = RecordingStatus::Pending;
+        recording.transcript = None;
+        recording.detected_language = None;
+        recording.error = None;
+        recording.delivered = None;
         self.write_recording(&recording)?;
         Ok(recording)
     }
