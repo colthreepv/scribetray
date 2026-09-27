@@ -492,7 +492,8 @@ fn start_recording(
 
     let caret = target.caret;
     info!(
-        "recording started; caret method={:?}",
+        "recording started; transcription mode={}; caret method={:?}",
+        if config.realtime { "realtime" } else { "batch" },
         caret.map(|item| item.method)
     );
     *active = Some(ActiveRecording {
@@ -613,18 +614,21 @@ fn start_streaming_transcription(
                 .unwrap_or_else(|_| Err("Realtime transcription worker stopped unexpectedly.".to_owned()));
             let result = match realtime {
                 Ok(transcription) => Ok(transcription),
-                Err(realtime_error) => match api_key {
-                    Some(api_key) => ScribeClient::new()
-                        .and_then(|client| {
-                            client.transcribe(&api_key, &pcm, &model, language.as_deref())
-                        })
-                        .map_err(|batch_error| {
-                            format!(
-                                "Realtime transcription failed ({realtime_error}); batch retry failed ({batch_error})."
-                            )
-                        }),
-                    None => Err("ELEVENLABS_API_KEY is not configured".to_owned()),
-                },
+                Err(realtime_error) => {
+                    warn!("Realtime transcription failed ({realtime_error}); retrying the complete audio with batch Scribe");
+                    match api_key {
+                        Some(api_key) => ScribeClient::new()
+                            .and_then(|client| {
+                                client.transcribe(&api_key, &pcm, &model, language.as_deref())
+                            })
+                            .map_err(|batch_error| {
+                                format!(
+                                    "Realtime transcription failed ({realtime_error}); batch retry failed ({batch_error})."
+                                )
+                            }),
+                        None => Err("ELEVENLABS_API_KEY is not configured".to_owned()),
+                    }
+                }
             };
             let _ = sender.send(WorkerFinished {
                 history_id: job_id,

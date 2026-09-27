@@ -69,8 +69,10 @@ push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
 clipboard-preserving paste, guarded Unicode typing, local history, retry,
 language selection, optional Enter, and per-user autostart.
 
-Earlier Codex App logs reported the mouse-position fallback; a run with the
-updated build reports UIA `TextPattern` caret detection. Long-dictation segment
-joining and Auto-Enter need another user round-trip. The complete caret and
-paste matrix across Codex App, Chrome, VS Code, Notepad, and Windows Terminal
-remains to be verified.
+Earlier Codex App logs reported the mouse-position fallback; updated runs have
+reported both UIA `TextPattern` caret detection and mouse fallback. The user
+confirmed that a 46-second Realtime recording retained the full message; a
+local WebSocket test also verifies joining multiple committed segments.
+Auto-Enter and Type mode still need clear desktop validation. The complete
+caret and paste matrix across Codex App, Chrome, VS Code, Notepad, and Windows
+Terminal remains to be verified.

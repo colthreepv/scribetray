@@ -8,6 +8,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
+use tracing::info;
 
 use crate::scribe::Transcription;
 
@@ -52,28 +53,41 @@ pub async fn transcribe_stream(
     api_key: &str,
     language_code: Option<&str>,
     keyterms: &[String],
+    audio: UnboundedReceiver<Vec<u8>>,
+) -> Result<Transcription, RealtimeError> {
+    transcribe_stream_at(ENDPOINT, api_key, language_code, keyterms, audio).await
+}
+
+async fn transcribe_stream_at(
+    endpoint_base: &str,
+    api_key: &str,
+    language_code: Option<&str>,
+    keyterms: &[String],
     mut audio: UnboundedReceiver<Vec<u8>>,
 ) -> Result<Transcription, RealtimeError> {
     if api_key.trim().is_empty() {
         return Err(RealtimeError::MissingApiKey);
     }
     let keyterms = validate_keyterms(keyterms)?;
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
-    query
-        .append_pair("model_id", "scribe_v2_realtime")
-        .append_pair("audio_format", "pcm_16000")
-        .append_pair("commit_strategy", "manual");
-    if let Some(language) = language_code
-        .map(str::trim)
-        .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
-    {
-        query.append_pair("language_code", language);
-    }
-    for term in &keyterms {
-        query.append_pair("keyterms", term);
-    }
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("model_id", "scribe_v2_realtime")
+            .append_pair("audio_format", "pcm_16000")
+            .append_pair("commit_strategy", "manual");
+        if let Some(language) = language_code
+            .map(str::trim)
+            .filter(|language| !language.is_empty() && !language.eq_ignore_ascii_case("auto"))
+        {
+            query.append_pair("language_code", language);
+        }
+        for term in &keyterms {
+            query.append_pair("keyterms", term);
+        }
+        query.finish()
+    };
 
-    let endpoint = format!("{ENDPOINT}?{}", query.finish());
+    let endpoint = format!("{endpoint_base}?{query}");
     let mut request = endpoint
         .into_client_request()
         .map_err(|_| RealtimeError::RequestSetup)?;
@@ -111,6 +125,7 @@ pub async fn transcribe_stream(
                             if commit {
                                 commits_sent += 1;
                                 audio_since_commit = 0;
+                                info!("sent realtime transcript segment commit {commits_sent}");
                             }
                         }
                     }
@@ -132,7 +147,12 @@ pub async fn transcribe_stream(
                 if let Some(transcription) = read_transcript_message(message)? {
                     commits_received += 1;
                     append_committed_segment(&mut committed_text, &transcription.text);
+                    info!("received realtime transcript segment {commits_received}");
                     if final_commit_sent && commits_received >= commits_sent {
+                        info!(
+                            "realtime transcription complete; segments={commits_received}, characters={}",
+                            committed_text.chars().count()
+                        );
                         return Ok(Transcription {
                             text: committed_text,
                             detected_language: transcription.detected_language,
@@ -301,4 +321,80 @@ pub enum RealtimeError {
     InvalidAudio,
     #[error("invalid keyterms: {0}")]
     InvalidKeyterms(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[tokio::test]
+    async fn joins_segments_from_a_long_realtime_recording() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"message_type": "session_started"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let mut commits = 0;
+            while let Some(message) = socket.next().await {
+                let Message::Text(message) = message.unwrap() else {
+                    continue;
+                };
+                let chunk: Value = serde_json::from_str(message.as_str()).unwrap();
+                if chunk["commit"] == true {
+                    commits += 1;
+                    let text = if commits == 1 {
+                        "first segment"
+                    } else {
+                        "second segment"
+                    };
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "message_type": "committed_transcript",
+                                "text": text,
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if commits == 2 {
+                        break;
+                    }
+                }
+            }
+            commits
+        });
+
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
+        let endpoint = format!("ws://{address}/v1/speech-to-text/realtime");
+        let transcription = tokio::spawn(async move {
+            transcribe_stream_at(&endpoint, "test-key", None, &[], audio_rx).await
+        });
+        for _ in 0..251 {
+            audio_tx.send(vec![0; 3_200]).unwrap();
+        }
+        drop(audio_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), transcription)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text, "first segment second segment");
+        assert_eq!(server.await.unwrap(), 2);
+    }
 }
