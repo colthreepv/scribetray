@@ -11,6 +11,10 @@ available so far; `cargo check` and a Windows release build also pass.
 | Notepad | — | — | — | — | Not tested |
 | Windows Terminal | — | — | — | — | Not tested |
 
+Caret discovery now also asks the focused child window for an MSAA caret when
+Windows reports no dedicated caret window. This code path still needs a desktop
+check in Codex App and other Chromium/Electron controls.
+
 The Win+Alt+V and Win+Alt+Shift+V registrations were confirmed in the app log.
 The local WebSocket mock test and the 46-second Realtime run pass. The user
 also tried Type mode with batch transcription and reported no obvious speed

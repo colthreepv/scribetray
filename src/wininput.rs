@@ -400,6 +400,17 @@ fn resolve_caret(
                 });
             }
         }
+        // Some Chromium/Electron controls expose OBJID_CARET on the focused
+        // child even when GetGUIThreadInfo reports no dedicated caret HWND.
+        if !gui.hwndFocus.0.is_null()
+            && gui.hwndFocus != gui.hwndCaret
+            && let Ok(Some(rect)) = msaa_caret_rect(gui.hwndFocus)
+        {
+            return Some(CaretSnapshot {
+                rect,
+                method: CaretMethod::Msaa,
+            });
+        }
     }
     if let Some(element) = focused_element {
         if let Ok(Some(rect)) = uia_caret_rect(element) {
