@@ -96,7 +96,7 @@ impl Default for Config {
             prefix: "🎙️ ".to_owned(),
             prefix_enabled: true,
             auto_enter: false,
-            insert_method: "paste".to_owned(),
+            insert_method: "type".to_owned(),
             restore_clipboard: true,
             max_seconds: 600,
             microphone: None,

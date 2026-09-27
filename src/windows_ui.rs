@@ -1158,6 +1158,12 @@ fn build_tray_menu(
         UiEvent::ToggleTypeMode,
         &mut actions,
     )?;
+    append_flags(
+        root.0,
+        MF_GRAYED,
+        0,
+        "Types text as keystrokes; avoids clipboard and helps with fields that block paste",
+    )?;
     append_check_action(
         root.0,
         "Start with Windows",

@@ -45,7 +45,9 @@ menu to use it. Optional `keyterms` in the TOML config are sent as Scribe
 vocabulary hints. The websocket uses ElevenLabs'
 [realtime API](https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime);
 the API reference documents a 20% transcription premium for non-empty keyterm
-lists, so the default list is empty.
+lists, so the default list is empty. New installations use Type mode by
+default: it simulates Unicode keystrokes and avoids relying on the clipboard.
+Use Paste mode from the tray menu for a field that handles paste better.
 
 Example settings:
 
@@ -55,6 +57,7 @@ hotkey_submit = "Win+Alt+Shift+V"
 mode = "toggle" # or "push_to_talk"
 realtime = false
 keyterms = []
+insert_method = "type" # or "paste"
 ```
 
 ## Implementation status
@@ -73,6 +76,8 @@ Earlier Codex App logs reported the mouse-position fallback; updated runs have
 reported both UIA `TextPattern` caret detection and mouse fallback. The user
 confirmed that a 46-second Realtime recording retained the full message; a
 local WebSocket test also verifies joining multiple committed segments.
-Auto-Enter and Type mode still need clear desktop validation. The complete
-caret and paste matrix across Codex App, Chrome, VS Code, Notepad, and Windows
-Terminal remains to be verified.
+The user confirmed Auto-Enter works in Codex App and reported no noticeable
+speed penalty with Type mode. New installations now default to Type mode; the
+complete caret and insertion compatibility matrix across Codex App, Chrome,
+VS Code, Notepad, and Windows Terminal remains to be verified. Windows Terminal
+is a secondary compatibility check, not a primary dictation workflow.

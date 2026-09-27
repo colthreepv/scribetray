@@ -788,6 +788,7 @@ fn complete_transcription(
             match wininput::insert_text(&target, &text, method, config.restore_clipboard) {
                 Ok(()) => {
                     if enter_after || config.auto_enter {
+                        thread::sleep(Duration::from_millis(80));
                         if let Err(error) = wininput::send_enter(&target) {
                             warn!("auto-enter failed after text insertion: {error}");
                             show_notice(
@@ -795,6 +796,8 @@ fn complete_transcription(
                                 "Scribetray",
                                 &format!("Text was inserted, but Enter failed: {error}"),
                             );
+                        } else {
+                            info!("auto-enter sent after text insertion");
                         }
                     }
                     info!("transcription inserted; method={method:?}");
