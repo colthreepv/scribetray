@@ -107,6 +107,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Loads settings from disk without creating a missing file.
+    pub fn load() -> Result<Self, ConfigError> {
+        let path = config_path()?;
+        let contents = fs::read_to_string(path)?;
+        Ok(toml::from_str(&contents)?)
+    }
+
     /// Loads the saved settings, creating the config directory and default file
     /// on the first run.
     pub fn load_or_create() -> Result<Self, ConfigError> {

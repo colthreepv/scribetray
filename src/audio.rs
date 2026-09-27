@@ -86,7 +86,7 @@ impl AudioRecorder {
         }
 
         let host = cpal::default_host();
-        let device = match device_name {
+        let device = match device_name.map(str::trim).filter(|name| !name.is_empty()) {
             Some(name) => find_input_device(&host, name)?,
             None => host
                 .default_input_device()
@@ -260,6 +260,25 @@ impl AudioRecorder {
     /// Returns true once capture has reached its configured duration limit.
     pub fn limit_reached(&self) -> bool {
         self.limit_reached.load(Ordering::Acquire)
+    }
+
+    /// Returns the available input device names for the tray microphone menu.
+    pub fn input_device_names() -> Result<Vec<String>, AudioError> {
+        let host = cpal::default_host();
+        let mut names = host
+            .input_devices()?
+            .map(|device| {
+                device
+                    .description()
+                    .ok()
+                    .map(|description| description.name().to_owned())
+                    .unwrap_or_else(|| device.to_string())
+            })
+            .filter(|name| !name.trim().is_empty())
+            .collect::<Vec<_>>();
+        names.sort_by_key(|name| name.to_lowercase());
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        Ok(names)
     }
 }
 

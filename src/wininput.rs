@@ -26,7 +26,8 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, CUIAutomation, IAccessible, IUIAutomation, IUIAutomationElement,
-    IUIAutomationTextPattern2, UIA_TextPattern2Id,
+    IUIAutomationTextPattern, IUIAutomationTextPattern2, IUIAutomationTextRange,
+    UIA_TextPattern2Id, UIA_TextPatternId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -47,8 +48,8 @@ pub enum CaretMethod {
     GuiThreadInfo,
     /// MSAA `OBJID_CARET` through the `hwndCaret` supplied by `GetGUIThreadInfo`.
     Msaa,
-    /// UI Automation `TextPattern2::GetCaretRange`.
-    UiaTextPattern2,
+    /// UI Automation `TextPattern2` or a collapsed `TextPattern` selection.
+    UiaTextPattern,
     /// Mouse position; this is only an anchor fallback, not a detected caret.
     MouseFallback,
 }
@@ -149,6 +150,30 @@ pub fn capture_target() -> Result<TargetSnapshot> {
     })
 }
 
+/// Refreshes the caret only while the original foreground and focused control
+/// are still active. A changed target returns `None` and leaves the saved
+/// anchor at its last known location.
+pub fn refresh_caret(target: &TargetSnapshot) -> Option<CaretSnapshot> {
+    let current = capture_target().ok()?;
+    if !same_input_target(target, &current) {
+        return None;
+    }
+    current.caret
+}
+
+fn same_input_target(expected: &TargetSnapshot, current: &TargetSnapshot) -> bool {
+    if expected.foreground != current.foreground {
+        return false;
+    }
+    if !expected.focused.0.is_null() && expected.focused != current.focused {
+        return false;
+    }
+    match expected.focused_runtime_id.as_deref() {
+        Some(runtime_id) => current.focused_runtime_id.as_deref() == Some(runtime_id),
+        None => !expected.focused.0.is_null() && expected.focused == current.focused,
+    }
+}
+
 /// Return whether the saved target is still the active foreground/focus target.
 ///
 /// If a RuntimeId was captured, failure to query the current RuntimeId is treated
@@ -192,7 +217,7 @@ pub fn copy_text(text: &str) -> Result<()> {
 pub fn send_enter(target: &TargetSnapshot) -> Result<()> {
     wait_for_hotkey_release()?;
     let _com = ComApartment::initialize()?;
-    if !target_is_current_inner(target) {
+    if !target_window_and_focus_are_current(target) {
         return Err(WinInputError::TargetChanged);
     }
     let inputs = [
@@ -200,6 +225,32 @@ pub fn send_enter(target: &TargetSnapshot) -> Result<()> {
         key_input(VK_RETURN, KEYEVENTF_KEYUP),
     ];
     send_inputs(&inputs)
+}
+
+// Some Chromium and Electron editors recreate their UIA text element when a
+// paste changes the document. For Enter, the foreground window and focused
+// HWND still provide a useful guard while allowing that UIA RuntimeId to change.
+fn target_window_and_focus_are_current(target: &TargetSnapshot) -> bool {
+    if target.foreground.0.is_null()
+        || (target.focused.0.is_null() && target.focused_runtime_id.is_none())
+        || unsafe { GetForegroundWindow() } != target.foreground
+    {
+        return false;
+    }
+
+    let current_gui = gui_thread_info(target.foreground).ok();
+    let current_focused = current_gui.as_ref().map(|info| info.hwndFocus);
+    if !target.focused.0.is_null() {
+        return current_focused == Some(target.focused);
+    }
+
+    match target.focused_runtime_id.as_deref() {
+        Some(expected) => focused_uia_element()
+            .ok()
+            .and_then(|element| runtime_id(&element).ok().flatten())
+            .is_some_and(|current| current == expected),
+        None => false,
+    }
 }
 
 fn paste_text(text: &str, restore_clipboard: bool) -> Result<()> {
@@ -354,7 +405,7 @@ fn resolve_caret(
         if let Ok(Some(rect)) = uia_caret_rect(element) {
             return Some(CaretSnapshot {
                 rect,
-                method: CaretMethod::UiaTextPattern2,
+                method: CaretMethod::UiaTextPattern,
             });
         }
     }
@@ -437,13 +488,35 @@ fn msaa_caret_rect(caret_window: HWND) -> WindowsResult<Option<CaretRect>> {
 }
 
 fn uia_caret_rect(element: &IUIAutomationElement) -> WindowsResult<Option<CaretRect>> {
-    let text_pattern: IUIAutomationTextPattern2 =
-        unsafe { element.GetCurrentPatternAs(UIA_TextPattern2Id)? };
-    let mut is_active = windows::core::BOOL(0);
-    let range = unsafe { text_pattern.GetCaretRange(&mut is_active)? };
-    if !is_active.as_bool() {
+    if let Ok(text_pattern) =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) }
+    {
+        let mut is_active = windows::core::BOOL(0);
+        if let Ok(range) = unsafe { text_pattern.GetCaretRange(&mut is_active) }
+            && is_active.as_bool()
+            && let Ok(Some(rect)) = text_range_rect(&range)
+        {
+            return Ok(Some(rect));
+        }
+    }
+
+    // Some Chromium providers expose TextPattern but return S_OK with a null
+    // TextPattern2 caret range. A collapsed selection can still expose the
+    // caret rectangle through the base pattern.
+    let text_pattern: IUIAutomationTextPattern =
+        unsafe { element.GetCurrentPatternAs(UIA_TextPatternId)? };
+    let selection = unsafe { text_pattern.GetSelection()? };
+    if unsafe { selection.Length()? } != 1 {
         return Ok(None);
     }
+    let range = unsafe { selection.GetElement(0)? };
+    if !unsafe { range.GetText(1)? }.is_empty() {
+        return Ok(None);
+    }
+    text_range_rect(&range)
+}
+
+fn text_range_rect(range: &IUIAutomationTextRange) -> WindowsResult<Option<CaretRect>> {
     let array = unsafe { range.GetBoundingRectangles()? };
     if array.is_null() {
         return Ok(None);

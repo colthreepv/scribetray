@@ -215,6 +215,8 @@ pub struct UiSettings {
     pub submit_hotkey: Hotkey,
     pub push_to_talk: bool,
     pub realtime_enabled: bool,
+    pub selected_microphone: Option<String>,
+    pub microphones: Vec<String>,
     pub prefix_enabled: bool,
     pub auto_enter: bool,
     pub sound_enabled: bool,
@@ -236,6 +238,8 @@ impl Default for UiSettings {
             ),
             push_to_talk: false,
             realtime_enabled: false,
+            selected_microphone: None,
+            microphones: Vec::new(),
             prefix_enabled: true,
             auto_enter: false,
             sound_enabled: true,
@@ -303,6 +307,7 @@ pub enum UiEvent {
     CaptureToggleHotkey,
     ToggleRecordingMode,
     ToggleRealtime,
+    MicrophoneSelected(Option<String>),
     TogglePrefix,
     ToggleAutoEnter,
     ToggleSound,
@@ -1161,6 +1166,42 @@ fn build_tray_menu(
         UiEvent::ToggleAutostart,
         &mut actions,
     )?;
+
+    let microphone_menu =
+        MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
+    let default_flags = if settings.selected_microphone.is_none() {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING | MF_UNCHECKED
+    };
+    let default_id = take_menu_id(&mut next_dynamic_id)?;
+    append_flags(
+        microphone_menu.0,
+        default_flags,
+        default_id as usize,
+        "System default",
+    )?;
+    actions.insert(default_id, UiEvent::MicrophoneSelected(None));
+    if settings.microphones.is_empty() {
+        append_flags(microphone_menu.0, MF_GRAYED, 0, "No input devices found")?;
+    } else {
+        for microphone in &settings.microphones {
+            let id = take_menu_id(&mut next_dynamic_id)?;
+            let flags = if settings.selected_microphone.as_deref() == Some(microphone) {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            };
+            append_flags(
+                microphone_menu.0,
+                flags,
+                id as usize,
+                &truncate_menu_label(microphone),
+            )?;
+            actions.insert(id, UiEvent::MicrophoneSelected(Some(microphone.clone())));
+        }
+    }
+    append_popup(root.0, microphone_menu, "Microphone")?;
 
     let language_menu = MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
     if settings.languages.is_empty() {

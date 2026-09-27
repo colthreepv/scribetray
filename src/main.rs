@@ -18,7 +18,7 @@ use std::{
     fs::{self, OpenOptions},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use audio::AudioRecorder;
@@ -35,6 +35,7 @@ use wininput::{InsertMethod, TargetSnapshot};
 
 const APP_DIRECTORY: &str = "Scribetray";
 const TICK: Duration = Duration::from_millis(200);
+const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(1_200);
 
 #[derive(Debug)]
@@ -53,7 +54,57 @@ struct ActiveRecording {
     realtime_result: Option<Receiver<Result<Transcription, String>>>,
     target: TargetSnapshot,
     started: Instant,
+    next_caret_refresh: Instant,
     submit_on_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigStamp {
+    modified: Option<SystemTime>,
+    length: u64,
+}
+
+struct ConfigMonitor {
+    observed: Option<ConfigStamp>,
+}
+
+impl ConfigMonitor {
+    fn new() -> Self {
+        Self {
+            observed: config_stamp(),
+        }
+    }
+
+    fn load_if_changed(&mut self, current: &Config) -> Option<Config> {
+        let stamp = config_stamp()?;
+        if self.observed.as_ref() == Some(&stamp) {
+            return None;
+        }
+        self.observed = Some(stamp);
+
+        let mut updated = match Config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                warn!("could not reload settings: {error}");
+                return None;
+            }
+        };
+        if let Err(error) = validate_config(&updated) {
+            warn!("ignored invalid settings update: {error}");
+            return None;
+        }
+        if updated == *current {
+            return None;
+        }
+        if updated.start_with_windows != current.start_with_windows
+            && let Err(error) = autostart::set_enabled(updated.start_with_windows)
+        {
+            warn!("could not update Start with Windows setting: {error}");
+            updated.start_with_windows = current.start_with_windows;
+        }
+        info!("settings reloaded from disk");
+        Some(updated)
+    }
 }
 
 fn main() {
@@ -66,15 +117,23 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut config = Config::load_or_create().map_err(|error| error.to_string())?;
-    parse_hotkey(&config.hotkey)?;
-    parse_hotkey(&config.hotkey_submit)?;
+    validate_config(&config)?;
+    let mut config_monitor = ConfigMonitor::new();
     if config.start_with_windows {
         if let Err(error) = autostart::set_enabled(true) {
             warn!("could not apply Start with Windows setting: {error}");
         }
     }
     let history = History::open().map_err(|error| error.to_string())?;
-    let mut ui_settings = make_ui_settings(&config, history.list().unwrap_or_default());
+    let microphones = match AudioRecorder::input_device_names() {
+        Ok(microphones) => microphones,
+        Err(error) => {
+            warn!("could not enumerate input devices: {error}");
+            Vec::new()
+        }
+    };
+    let mut ui_settings =
+        make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
     let ui = UiRuntime::start(ui_settings.clone())?;
     let (worker_tx, worker_rx) = mpsc::channel();
 
@@ -132,7 +191,18 @@ fn run() -> Result<(), String> {
             active.is_some(),
             &mut done_until,
         );
-        update_timers(&ui, active.as_ref(), &mut done_until);
+        update_timers(&ui, active.as_mut(), &mut done_until);
+        if active.is_none()
+            && let Some(updated) = config_monitor.load_if_changed(&config)
+        {
+            config = updated;
+            let microphones = ui_settings.microphones.clone();
+            ui_settings =
+                make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
+            if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
+                warn!("could not apply reloaded settings: {error}");
+            }
+        }
     }
 
     if let Some(recording) = active.take() {
@@ -248,6 +318,10 @@ fn handle_ui_event(
             config.realtime = !config.realtime;
             save_config(config, ui);
         }
+        UiEvent::MicrophoneSelected(microphone) => {
+            config.microphone = microphone.filter(|name| !name.trim().is_empty());
+            save_config(config, ui);
+        }
         UiEvent::TogglePrefix => {
             config.prefix_enabled = !config.prefix_enabled;
             save_config(config, ui);
@@ -329,7 +403,8 @@ fn handle_ui_event(
         }
     }
 
-    *ui_settings = make_ui_settings(config, history.list().unwrap_or_default());
+    let microphones = ui_settings.microphones.clone();
+    *ui_settings = make_ui_settings(config, history.list().unwrap_or_default(), microphones);
     if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
         warn!("could not refresh tray settings: {error}");
     }
@@ -425,12 +500,13 @@ fn start_recording(
         realtime_result,
         target,
         started: Instant::now(),
+        next_caret_refresh: Instant::now(),
         submit_on_complete,
     });
     *done_until = None;
     let _ = ui.send(UiCommand::SetRecording(true));
     play_cue(config.sound_cues, 0x40);
-    update_timers(ui, active.as_ref(), done_until);
+    update_timers(ui, active.as_mut(), done_until);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -709,6 +785,7 @@ fn complete_transcription(
                 Ok(()) => {
                     if enter_after || config.auto_enter {
                         if let Err(error) = wininput::send_enter(&target) {
+                            warn!("auto-enter failed after text insertion: {error}");
                             show_notice(
                                 ui,
                                 "Scribetray",
@@ -774,10 +851,17 @@ fn complete_transcription(
 
 fn update_timers(
     ui: &UiRuntime,
-    active: Option<&ActiveRecording>,
+    active: Option<&mut ActiveRecording>,
     done_until: &mut Option<Instant>,
 ) {
     if let Some(recording) = active {
+        let now = Instant::now();
+        if now >= recording.next_caret_refresh {
+            if let Some(caret) = wininput::refresh_caret(&recording.target) {
+                recording.target.caret = Some(caret);
+            }
+            recording.next_caret_refresh = now + CARET_REFRESH;
+        }
         if let Some(caret) = recording.target.caret {
             let _ = ui.update_caret_anchor(
                 ui_caret(caret.rect),
@@ -811,7 +895,11 @@ fn ui_caret(rect: wininput::CaretRect) -> UiCaretRect {
     }
 }
 
-fn make_ui_settings(config: &Config, recordings: Vec<Recording>) -> UiSettings {
+fn make_ui_settings(
+    config: &Config,
+    recordings: Vec<Recording>,
+    microphones: Vec<String>,
+) -> UiSettings {
     let toggle_hotkey = parse_hotkey(&config.hotkey).unwrap_or_default();
     let submit_hotkey = parse_hotkey(&config.hotkey_submit).unwrap_or_else(|_| {
         Hotkey::with_modifiers(b'V' as u32, "V", HotkeyModifiers::new(true, false))
@@ -848,6 +936,8 @@ fn make_ui_settings(config: &Config, recordings: Vec<Recording>) -> UiSettings {
         submit_hotkey,
         push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
         realtime_enabled: config.realtime,
+        selected_microphone: config.microphone.clone(),
+        microphones,
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
         sound_enabled: config.sound_cues,
@@ -857,6 +947,35 @@ fn make_ui_settings(config: &Config, recordings: Vec<Recording>) -> UiSettings {
         languages,
         history,
     }
+}
+
+fn config_stamp() -> Option<ConfigStamp> {
+    let path = config_path().ok()?;
+    let metadata = fs::metadata(path).ok()?;
+    Some(ConfigStamp {
+        modified: metadata.modified().ok(),
+        length: metadata.len(),
+    })
+}
+
+fn validate_config(config: &Config) -> Result<(), String> {
+    parse_hotkey(&config.hotkey)?;
+    parse_hotkey(&config.hotkey_submit)?;
+    if config.max_seconds == 0 {
+        return Err("max_seconds must be greater than zero".to_owned());
+    }
+    if !config.mode.eq_ignore_ascii_case("toggle")
+        && !config.mode.eq_ignore_ascii_case("push_to_talk")
+    {
+        return Err("mode must be either toggle or push_to_talk".to_owned());
+    }
+    if !config.insert_method.eq_ignore_ascii_case("paste")
+        && !config.insert_method.eq_ignore_ascii_case("type")
+    {
+        return Err("insert_method must be either paste or type".to_owned());
+    }
+    realtime::validate_keyterms(&config.keyterms).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn history_label(recording: &Recording) -> String {
@@ -957,7 +1076,7 @@ fn refresh_history_menu(ui: &UiRuntime, history: &History) {
     match history.list() {
         Ok(recordings) => {
             let _ = ui.send(UiCommand::UpdateHistory(
-                make_ui_settings(&Config::default(), recordings).history,
+                make_ui_settings(&Config::default(), recordings, Vec::new()).history,
             ));
         }
         Err(error) => warn!("could not refresh history menu: {error}"),

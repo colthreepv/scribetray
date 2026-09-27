@@ -14,6 +14,7 @@ use crate::scribe::Transcription;
 const ENDPOINT: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(15);
+const MANUAL_COMMIT_INTERVAL_BYTES: usize = 16_000 * 2 * 25;
 const MAX_KEYTERMS: usize = 50;
 const MAX_KEYTERM_CHARACTERS: usize = 20;
 
@@ -44,8 +45,9 @@ pub fn validate_keyterms(keyterms: &[String]) -> Result<Vec<String>, RealtimeErr
         .collect()
 }
 
-/// Streams 16 kHz mono signed-16 little-endian PCM to Scribe and returns the
-/// final committed transcript. The last audio chunk is committed explicitly.
+/// Streams 16 kHz mono signed-16 little-endian PCM to Scribe, committing
+/// segments before the service's automatic ~36-second boundary and joining
+/// every committed segment when recording stops.
 pub async fn transcribe_stream(
     api_key: &str,
     language_code: Option<&str>,
@@ -88,25 +90,36 @@ pub async fn transcribe_stream(
     wait_for_session(&mut incoming).await?;
 
     let mut pending_chunk: Option<Vec<u8>> = None;
-    let mut commit_sent = false;
+    let mut final_commit_sent = false;
+    let mut commits_sent = 0_u32;
+    let mut commits_received = 0_u32;
+    let mut audio_since_commit = 0_usize;
+    let mut committed_text = String::new();
     let mut commit_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(86_400)));
     loop {
         tokio::select! {
-            chunk = audio.recv(), if !commit_sent => {
+            chunk = audio.recv(), if !final_commit_sent => {
                 match chunk {
                     Some(chunk) if !chunk.is_empty() => {
                         if chunk.len() % 2 != 0 {
                             return Err(RealtimeError::InvalidAudio);
                         }
                         if let Some(previous) = pending_chunk.replace(chunk) {
-                            send_audio_chunk(&mut sink, &previous, false).await?;
+                            audio_since_commit = audio_since_commit.saturating_add(previous.len());
+                            let commit = audio_since_commit >= MANUAL_COMMIT_INTERVAL_BYTES;
+                            send_audio_chunk(&mut sink, &previous, commit).await?;
+                            if commit {
+                                commits_sent += 1;
+                                audio_since_commit = 0;
+                            }
                         }
                     }
                     Some(_) => {}
                     None => {
                         let final_chunk = pending_chunk.take().ok_or(RealtimeError::EmptyAudio)?;
                         send_audio_chunk(&mut sink, &final_chunk, true).await?;
-                        commit_sent = true;
+                        commits_sent += 1;
+                        final_commit_sent = true;
                         commit_timeout
                             .as_mut()
                             .reset(tokio::time::Instant::now() + COMMIT_TIMEOUT);
@@ -116,17 +129,33 @@ pub async fn transcribe_stream(
             message = incoming.next() => {
                 let message = message.ok_or(RealtimeError::ConnectionClosed)?
                     .map_err(|_| RealtimeError::Connection)?;
-                if let Some(transcription) = read_transcript_message(message)?
-                    && commit_sent
-                {
-                    return Ok(transcription);
+                if let Some(transcription) = read_transcript_message(message)? {
+                    commits_received += 1;
+                    append_committed_segment(&mut committed_text, &transcription.text);
+                    if final_commit_sent && commits_received >= commits_sent {
+                        return Ok(Transcription {
+                            text: committed_text,
+                            detected_language: transcription.detected_language,
+                        });
+                    }
                 }
             }
-            _ = &mut commit_timeout, if commit_sent => {
+            _ = &mut commit_timeout, if final_commit_sent => {
                 return Err(RealtimeError::CommitTimeout);
             }
         }
     }
+}
+
+fn append_committed_segment(transcript: &mut String, segment: &str) {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        return;
+    }
+    if !transcript.is_empty() && !transcript.chars().last().is_some_and(char::is_whitespace) {
+        transcript.push(' ');
+    }
+    transcript.push_str(segment);
 }
 
 async fn wait_for_session(
@@ -161,10 +190,12 @@ fn read_session_message(message: Message) -> Result<Option<bool>, RealtimeError>
     };
     let event: ServerEvent =
         serde_json::from_str(text.as_str()).map_err(|_| RealtimeError::InvalidResponse)?;
+    if let Some(error) = server_error(&event) {
+        return Err(error);
+    }
     match event.message_type.as_str() {
         "session_started" => Ok(Some(true)),
         "warning" | "partial_transcript" | "committed_transcript" => Ok(None),
-        "rate_limited" | "error" => Err(RealtimeError::Rejected),
         _ => Ok(None),
     }
 }
@@ -178,14 +209,42 @@ fn read_transcript_message(message: Message) -> Result<Option<Transcription>, Re
     };
     let event: ServerEvent =
         serde_json::from_str(text.as_str()).map_err(|_| RealtimeError::InvalidResponse)?;
+    if let Some(error) = server_error(&event) {
+        return Err(error);
+    }
     match event.message_type.as_str() {
         "committed_transcript" => Ok(Some(Transcription {
             text: event.text.unwrap_or_default(),
             detected_language: None,
         })),
-        "rate_limited" | "error" => Err(RealtimeError::Rejected),
         _ => Ok(None),
     }
+}
+
+fn server_error(event: &ServerEvent) -> Option<RealtimeError> {
+    if event.message_type == "session_time_limit_exceeded" {
+        return Some(RealtimeError::SessionTimeLimitExceeded);
+    }
+    matches!(
+        event.message_type.as_str(),
+        "auth_error"
+            | "quota_exceeded"
+            | "transcriber_error"
+            | "input_error"
+            | "invalid_request"
+            | "rate_limited"
+            | "commit_throttled"
+            | "unaccepted_terms"
+            | "queue_overflow"
+            | "resource_exhausted"
+            | "chunk_size_exceeded"
+            | "insufficient_audio_activity"
+            | "error"
+    )
+    .then(|| RealtimeError::Server {
+        kind: event.message_type.clone(),
+        details: event.error.clone().unwrap_or_default(),
+    })
 }
 
 async fn send_audio_chunk(
@@ -208,6 +267,8 @@ struct ServerEvent {
     message_type: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -226,8 +287,10 @@ pub enum RealtimeError {
     SessionTimeout,
     #[error("ElevenLabs realtime connection closed unexpectedly")]
     ConnectionClosed,
-    #[error("ElevenLabs realtime transcription was rate-limited or rejected")]
-    Rejected,
+    #[error("ElevenLabs realtime session reached its maximum duration")]
+    SessionTimeLimitExceeded,
+    #[error("ElevenLabs realtime server returned {kind}: {details}")]
+    Server { kind: String, details: String },
     #[error("realtime transcription returned an invalid response")]
     InvalidResponse,
     #[error("realtime transcription did not finish in time")]
