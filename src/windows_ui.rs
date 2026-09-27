@@ -284,7 +284,6 @@ impl CaretRect {
 pub enum AnchorStatus {
     Recording { elapsed: Duration },
     Working,
-    Done,
     Error,
 }
 
@@ -1158,12 +1157,6 @@ fn build_tray_menu(
         UiEvent::ToggleTypeMode,
         &mut actions,
     )?;
-    append_flags(
-        root.0,
-        MF_GRAYED,
-        0,
-        "Types text as keystrokes; avoids clipboard and helps with fields that block paste",
-    )?;
     append_check_action(
         root.0,
         "Start with Windows",
@@ -1408,8 +1401,7 @@ unsafe extern "system" fn window_proc(
     } else {
         if message == TRAY_CALLBACK {
             match lparam.0 as u32 & 0xffff {
-                WM_RBUTTONUP | WM_CONTEXTMENU => state.show_menu(),
-                WM_LBUTTONUP | NIN_SELECT => state.handle_user_event(UiEvent::ToggleRecord),
+                WM_RBUTTONUP | WM_CONTEXTMENU | WM_LBUTTONUP | NIN_SELECT => state.show_menu(),
                 _ => {}
             }
             return LRESULT(0);
@@ -1496,7 +1488,6 @@ fn draw_overlay_contents(hdc: HDC, status: AnchorStatus) {
             )
         }
         AnchorStatus::Working => (rgb(245, 158, 11), "Working".to_owned()),
-        AnchorStatus::Done => (rgb(34, 197, 94), "Done".to_owned()),
         AnchorStatus::Error => (rgb(239, 68, 68), "Error".to_owned()),
     };
     let card_brush = unsafe { CreateSolidBrush(rgb(25, 28, 36)) };

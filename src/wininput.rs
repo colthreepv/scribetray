@@ -6,19 +6,23 @@
 
 use std::mem::{ManuallyDrop, size_of};
 use std::ptr;
+use std::slice;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+use tracing::{info, warn};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HINSTANCE, HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject, SAFEARRAY};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardOwner, OpenClipboard,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
+    OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Ole::{
     CF_UNICODETEXT, OleGetClipboard, OleInitialize, OleSetClipboard, OleUninitialize,
     SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
@@ -107,13 +111,6 @@ pub enum WinInputError {
     PartialInput { sent: u32, expected: u32 },
     #[error("clipboard data could not be read for preservation: {0}")]
     ClipboardSnapshot(WindowsError),
-    #[error("clipboard restoration failed after insertion: {0}")]
-    ClipboardRestore(WindowsError),
-    #[error("insertion failed ({insertion}) and clipboard restoration also failed ({restoration})")]
-    InsertionAndClipboardRestore {
-        insertion: Box<WinInputError>,
-        restoration: Box<WinInputError>,
-    },
     #[error("the clipboard owner window could not be created")]
     ClipboardOwnerUnavailable,
     #[error("the clipboard text is too large to allocate")]
@@ -267,22 +264,15 @@ fn paste_text(text: &str, restore_clipboard: bool) -> Result<()> {
         Ok(())
     });
 
-    let restore_result = match backup {
-        Some(backup) => backup
-            .restore_if_still_owned(owner.hwnd)
-            .map_err(WinInputError::ClipboardRestore),
-        None => Ok(()),
-    };
-
-    match (insert_result, restore_result) {
-        (Err(insertion), Err(restoration)) => Err(WinInputError::InsertionAndClipboardRestore {
-            insertion: Box::new(insertion),
-            restoration: Box::new(restoration),
-        }),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+    if let Some(backup) = backup {
+        match backup.restore_if_still_owned(owner.hwnd, text) {
+            Ok(true) => info!("clipboard restored after paste"),
+            Ok(false) => warn!("clipboard changed during paste; preserving its newer contents"),
+            Err(error) => warn!("text was pasted but clipboard restore failed: {error}"),
+        }
     }
+
+    insert_result
 }
 
 fn target_is_current_inner(target: &TargetSnapshot) -> bool {
@@ -760,14 +750,60 @@ impl ClipboardBackup {
         }
     }
 
-    fn restore_if_still_owned(self, temporary_owner: HWND) -> WindowsResult<()> {
-        if unsafe { GetClipboardOwner()? } != temporary_owner {
-            // Another application has replaced the temporary paste clipboard.
-            // Leave its newer contents intact instead of restoring stale data.
-            return Ok(());
+    fn restore_if_still_owned(
+        self,
+        temporary_owner: HWND,
+        pasted_text: &str,
+    ) -> WindowsResult<bool> {
+        let still_contains_pasted_text = if unsafe { GetClipboardOwner()? } == temporary_owner {
+            true
+        } else {
+            let mut matches = false;
+            for attempt in 0..5 {
+                if clipboard_text_matches(pasted_text) {
+                    matches = true;
+                    break;
+                }
+                if attempt < 4 {
+                    sleep(Duration::from_millis(20));
+                }
+            }
+            matches
+        };
+        if !still_contains_pasted_text {
+            // Another application has replaced our temporary text with newer
+            // clipboard contents; leave those contents intact.
+            return Ok(false);
         }
-        self.restore(temporary_owner)
+        self.restore(temporary_owner)?;
+        Ok(true)
     }
+}
+
+fn clipboard_text_matches(expected: &str) -> bool {
+    let Ok(_clipboard) = ClipboardOpen::open(None) else {
+        return false;
+    };
+    let Ok(handle) = (unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }) else {
+        return false;
+    };
+    let memory = HGLOBAL(handle.0);
+    let size_bytes = unsafe { GlobalSize(memory) };
+    if size_bytes < size_of::<u16>() || size_bytes % size_of::<u16>() != 0 {
+        return false;
+    }
+    let locked = unsafe { GlobalLock(memory) };
+    if locked.is_null() {
+        return false;
+    }
+    let words =
+        unsafe { slice::from_raw_parts(locked.cast::<u16>(), size_bytes / size_of::<u16>()) };
+    let matches = words
+        .iter()
+        .position(|word| *word == 0)
+        .is_some_and(|length| words[..length].iter().copied().eq(expected.encode_utf16()));
+    let _ = unsafe { GlobalUnlock(memory) };
+    matches
 }
 
 fn set_clipboard_text(owner: HWND, text: &str) -> Result<()> {

@@ -16,7 +16,11 @@ mod wininput;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    sync::mpsc::{self, Receiver, Sender},
+    mem::size_of,
+    sync::{
+        OnceLock,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -27,6 +31,14 @@ use directories::BaseDirs;
 use history::{History, Recording, RecordingStatus};
 use scribe::{ScribeClient, Transcription};
 use tracing::{error, info, warn};
+use windows::{
+    Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
+        System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
+    },
+    core::PCWSTR,
+};
 use windows_ui::{
     AnchorStatus, CaretRect as UiCaretRect, HistoryMenuItem, Hotkey, HotkeyModifiers,
     LanguageOption, UiCommand, UiEvent, UiRuntime, UiSettings,
@@ -37,6 +49,9 @@ const APP_DIRECTORY: &str = "Scribetray";
 const TICK: Duration = Duration::from_millis(200);
 const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(1_200);
+const CUE_SAMPLE_RATE: u32 = 22_050;
+
+static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
 
 #[derive(Debug)]
 struct WorkerFinished {
@@ -802,11 +817,8 @@ fn complete_transcription(
                     }
                     info!("transcription inserted; method={method:?}");
                     if !recording_active {
-                        if let Some(caret) = target.caret {
-                            let _ =
-                                ui.update_caret_anchor(ui_caret(caret.rect), AnchorStatus::Done);
-                        }
-                        *done_until = Some(Instant::now() + DONE_DISPLAY);
+                        let _ = ui.hide_caret_anchor();
+                        *done_until = None;
                     }
                     play_cue(config.sound_cues, 0x40);
                 }
@@ -849,7 +861,8 @@ fn complete_transcription(
                 ),
             }
             if !recording_active {
-                *done_until = Some(Instant::now() + DONE_DISPLAY);
+                let _ = ui.hide_caret_anchor();
+                *done_until = None;
             }
             play_cue(config.sound_cues, 0x40);
         }
@@ -989,11 +1002,40 @@ fn history_label(recording: &Recording) -> String {
     let minutes = recording.duration_seconds / 60;
     let seconds = recording.duration_seconds % 60;
     let status = match recording.status {
-        RecordingStatus::Pending => "Pending".to_owned(),
-        RecordingStatus::Succeeded => "Done".to_owned(),
-        RecordingStatus::Failed => "Failed".to_owned(),
+        RecordingStatus::Pending => " — Pending",
+        RecordingStatus::Succeeded => "",
+        RecordingStatus::Failed => " — Failed",
     };
-    format!("{minutes:02}:{seconds:02} — {status}")
+    format!(
+        "{} · {minutes:02}:{seconds:02}{status}",
+        history_timestamp_label(recording.timestamp_ms)
+    )
+}
+
+fn history_timestamp_label(timestamp_ms: u64) -> String {
+    const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+    let Some(ticks) = timestamp_ms
+        .checked_mul(10_000)
+        .and_then(|ticks| ticks.checked_add(WINDOWS_EPOCH_OFFSET_100NS))
+    else {
+        return "Unknown date".to_owned();
+    };
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    if unsafe { FileTimeToSystemTime(&file_time, &mut utc) }.is_err() {
+        return "Unknown date".to_owned();
+    }
+    let mut local = SYSTEMTIME::default();
+    if unsafe { SystemTimeToTzSpecificLocalTime(None, &utc, &mut local) }.is_err() {
+        return "Unknown date".to_owned();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
+    )
 }
 
 fn parse_hotkey(value: &str) -> Result<Hotkey, String> {
@@ -1131,11 +1173,70 @@ fn show_notice(ui: &UiRuntime, title: &str, message: &str) {
 }
 
 fn play_cue(enabled: bool, cue: u32) {
-    if enabled {
-        unsafe {
-            let _ = MessageBeep(cue);
+    if !enabled {
+        return;
+    }
+
+    let waves = SOUND_WAVES.get_or_init(|| {
+        [
+            make_cue_wave(&[660, 880], 65, 18),
+            make_cue_wave(&[330], 150, 0),
+        ]
+    });
+    let wave = if cue == 0x10 { &waves[1] } else { &waves[0] };
+    let played = unsafe {
+        PlaySoundW(
+            PCWSTR::from_raw(wave.as_ptr().cast()),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        )
+        .as_bool()
+    };
+    if !played {
+        let fallback_played = unsafe { MessageBeep(cue) != 0 };
+        warn!(
+            "wave sound cue playback failed; Windows message beep fallback played={fallback_played}"
+        );
+    }
+}
+
+fn make_cue_wave(frequencies: &[u32], tone_ms: u32, gap_ms: u32) -> Vec<u8> {
+    let tone_samples = (CUE_SAMPLE_RATE * tone_ms / 1_000) as usize;
+    let gap_samples = (CUE_SAMPLE_RATE * gap_ms / 1_000) as usize;
+    let sample_count =
+        tone_samples * frequencies.len() + gap_samples * frequencies.len().saturating_sub(1);
+    let data_bytes = (sample_count * size_of::<i16>()) as u32;
+    let mut wave = Vec::with_capacity(44 + data_bytes as usize);
+    wave.extend_from_slice(b"RIFF");
+    wave.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wave.extend_from_slice(b"WAVEfmt ");
+    wave.extend_from_slice(&16_u32.to_le_bytes());
+    wave.extend_from_slice(&1_u16.to_le_bytes());
+    wave.extend_from_slice(&1_u16.to_le_bytes());
+    wave.extend_from_slice(&CUE_SAMPLE_RATE.to_le_bytes());
+    wave.extend_from_slice(&(CUE_SAMPLE_RATE * size_of::<i16>() as u32).to_le_bytes());
+    wave.extend_from_slice(&(size_of::<i16>() as u16).to_le_bytes());
+    wave.extend_from_slice(&16_u16.to_le_bytes());
+    wave.extend_from_slice(b"data");
+    wave.extend_from_slice(&data_bytes.to_le_bytes());
+
+    let attack_samples = (CUE_SAMPLE_RATE as usize * 5 / 1_000).max(1);
+    let release_samples = (CUE_SAMPLE_RATE as usize * 14 / 1_000).max(1);
+    for (tone_index, frequency) in frequencies.iter().copied().enumerate() {
+        for index in 0..tone_samples {
+            let attack = (index + 1) as f32 / attack_samples as f32;
+            let release = (tone_samples - index) as f32 / release_samples as f32;
+            let envelope = attack.min(release).min(1.0);
+            let phase =
+                std::f32::consts::TAU * frequency as f32 * index as f32 / CUE_SAMPLE_RATE as f32;
+            let sample = (phase.sin() * envelope * 0.22 * i16::MAX as f32) as i16;
+            wave.extend_from_slice(&sample.to_le_bytes());
+        }
+        if tone_index + 1 < frequencies.len() {
+            wave.resize(wave.len() + gap_samples * size_of::<i16>(), 0);
         }
     }
+    wave
 }
 
 fn show_error_dialog(message: &str) {

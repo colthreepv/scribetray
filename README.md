@@ -24,6 +24,7 @@ under `%LOCALAPPDATA%\Scribetray`.
   recording. The tray menu can switch to push-to-talk, where holding the
   configured toggle chord records until you release it.
 - **Win+Alt+Shift+V** records and submits with Enter.
+- Clicking the system-tray icon opens the menu; it does not start recording.
 - The tray menu can capture a new toggle hotkey and controls push-to-talk,
   realtime transcription, microphone selection, the emoji prefix, Auto-Enter,
   sound cues, typing mode, language, Start with Windows, and recording history.
@@ -33,6 +34,8 @@ under `%LOCALAPPDATA%\Scribetray`.
   and Shift modifiers.
 - Failed uploads keep the PCM recording in history for retry. A focus change
   before insertion sends the transcript to the clipboard instead.
+- History entries show the local date and recording duration. Successful entries
+  have no redundant “Done” label; pending and failed entries keep their status.
 
 The app reads `ELEVENLABS_API_KEY` first, then `api_key` from the config file.
 Batch Scribe requests send `tag_audio_events=false`. Realtime mode opens a
@@ -81,3 +84,10 @@ speed penalty with Type mode. New installations now default to Type mode; the
 complete caret and insertion compatibility matrix across Codex App, Chrome,
 VS Code, Notepad, and Windows Terminal remains to be verified. Windows Terminal
 is a secondary compatibility check, not a primary dictation workflow.
+
+The latest desktop feedback reports that message-beep sound cues were inaudible,
+and that Paste mode can leave the clipboard replaced and skip Auto-Enter. The
+app now uses embedded WAV cues and restores the saved clipboard when the
+temporary transcript is still present, while preserving newer clipboard data.
+Left-click on the tray icon opens the menu. Sound output and Chrome Paste-mode
+Auto-Enter still need a retest with the updated executable.
