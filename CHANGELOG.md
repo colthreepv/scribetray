@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.2
+
+Preserves recordings through recoverable audio-capture glitches, logs user
+notices even when Windows suppresses notification balloons, and fixes the
+hotkey-capture dialog's message loop. Adds square social artwork and its source
+renderer.
+
 ## v0.6.1
 
 Added a first-run API-key reminder and comments to the generated configuration
