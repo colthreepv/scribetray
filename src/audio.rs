@@ -82,10 +82,38 @@ pub enum AudioError {
 pub struct AudioRecorder {
     stream: Option<cpal::Stream>,
     capture: Arc<Mutex<CaptureState>>,
-    stream_error: Arc<Mutex<Option<String>>>,
+    stream_error: Arc<StreamErrors>,
     limit_reached: Arc<AtomicBool>,
     level: Arc<AtomicU32>,
     max_seconds: u32,
+}
+
+/// Errors reported by the CPAL error callback during capture.
+///
+/// WASAPI reports a data discontinuity as `ErrorKind::Xrun` while the stream
+/// keeps delivering audio. This happens routinely when another app, such as
+/// Microsoft Teams, shares the same microphone. Those events are counted
+/// instead of discarding the whole recording.
+#[derive(Default)]
+struct StreamErrors {
+    fatal: Mutex<Option<String>>,
+    glitches: AtomicU32,
+}
+
+impl StreamErrors {
+    fn report(&self, error: &cpal::Error) {
+        if matches!(
+            error.kind(),
+            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
+        ) {
+            self.glitches.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut fatal = lock_recover(&self.fatal);
+        if fatal.is_none() {
+            *fatal = Some(error.to_string());
+        }
+    }
 }
 
 impl AudioRecorder {
@@ -147,7 +175,7 @@ impl AudioRecorder {
             realtime_sender,
             level.clone(),
         )));
-        let stream_error = Arc::new(Mutex::new(None));
+        let stream_error = Arc::new(StreamErrors::default());
         let limit_reached = Arc::new(AtomicBool::new(false));
 
         let stream = match config.sample_format() {
@@ -264,7 +292,11 @@ impl AudioRecorder {
             }
         }
 
-        if let Some(error) = lock_recover(&self.stream_error).take() {
+        let glitches = self.stream_error.glitches.load(Ordering::Relaxed);
+        if glitches > 0 {
+            tracing::warn!("audio capture reported {glitches} non-fatal stream glitch(es)");
+        }
+        if let Some(error) = lock_recover(&self.stream_error.fatal).take() {
             return Err(AudioError::Stream(error));
         }
 
@@ -403,7 +435,7 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     capture: Arc<Mutex<CaptureState>>,
-    stream_error: Arc<Mutex<Option<String>>>,
+    stream_error: Arc<StreamErrors>,
     limit_reached: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -419,12 +451,7 @@ where
                 limit_reached.store(true, Ordering::Release);
             }
         },
-        move |error| {
-            let mut stored_error = lock_recover(&stream_error);
-            if stored_error.is_none() {
-                *stored_error = Some(error.to_string());
-            }
-        },
+        move |error| stream_error.report(&error),
         None,
     )
 }

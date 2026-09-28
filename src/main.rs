@@ -1449,6 +1449,7 @@ fn initialize_logging() {
 }
 
 fn show_notice(ui: &UiRuntime, title: &str, message: &str) {
+    warn!("{title}: {message}");
     let _ = ui.send(UiCommand::Notice {
         title: title.to_owned(),
         message: message.to_owned(),
