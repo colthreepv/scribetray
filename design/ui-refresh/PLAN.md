@@ -84,7 +84,21 @@ Accept: in the Codex composer, Win+Alt+V, speaking, then Enter inserts the text 
 
 Dropped: the `overlay_timer` / `overlay_position` config keys. The fixed defaults are fine.
 
+## 6. ElevenLabs usage line in the tray menu
+
+Show a single grayed, non-clickable line at the top of the right-click menu, above "Start recording":
+
+```
+ElevenLabs: 1,084 / 23,130 credits (5%) · resets Oct 6
+```
+
+- Source: `GET https://api.elevenlabs.io/v1/user/subscription` with the existing `api_key` (`xi-api-key` header). Use `character_count`, `character_limit`, and `next_character_count_reset_unix`. Format the reset date with the OS locale (`GetDateFormatEx`, month + day). If `current_overage.amount` is non-zero, append `· overage $X`. Omit the reset part when the timestamp is `null`.
+- Refresh: once at startup, then in the background when the menu opens and the cached value is older than 10 minutes. The menu always renders immediately from the cache and never waits for the network. Do not fetch after each transcription.
+- Permissions: the key must have `user_read` in addition to `speech_to_text`. If the call returns 401 or 403, hide the line, log one warning naming the missing permission, and don't retry until the config is reloaded. On other errors, keep showing the last good value; if there is none, hide the line.
+- No owner-drawn progress bar for now.
+
+Accept: with the current key, the menu shows the line above. With a key lacking `user_read`, the line is absent and nothing else changes.
+
 ## Order
 
-§2 data change → §3 left click → §4 Enter/remove submit hotkey → rebuild for §1 → §5 if time allows. Update README for §3 and §4.
-
+§2 data change → §3 left click → §4 Enter/remove submit hotkey → rebuild for §1 → §6 usage line → §5 if time allows. Update README for §3 and §4.
