@@ -125,7 +125,7 @@ const USAGE_NORMAL_RGB: (u8, u8, u8) = (0xF0, 0x56, 0x4A);
 const USAGE_WARN_RGB: (u8, u8, u8) = (0xF5, 0xA5, 0x24);
 const USAGE_CRITICAL_RGB: (u8, u8, u8) = (0xDC, 0x26, 0x26);
 
-/// Colors taken verbatim from `design/ui-refresh/overlay-prototype.html`.
+/// Colors shared by the tray, recording overlay, and menu status states.
 const REC_RGB: (u8, u8, u8) = (0xF0, 0x44, 0x38);
 const WORK_RGB: (u8, u8, u8) = (0xF5, 0xA5, 0x24);
 const BAR_RGB: (u8, u8, u8) = (0xF0, 0xF2, 0xF5);
@@ -2380,9 +2380,8 @@ unsafe extern "system" fn window_proc(
 
 /// Rasterizes the current overlay state into a premultiplied RGBA pixmap.
 ///
-/// This is a port of frame() from
-/// design/ui-refresh/overlay-prototype.html: geometry is written in the
-/// prototype's device-independent pixels and multiplied by the scale factor.
+/// The geometry is written in device-independent pixels and multiplied by the
+/// monitor scale factor.
 fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
     let pad = OVERLAY_SHADOW_PAD_DIP * scale;
     let countdown = overlay_countdown(state);

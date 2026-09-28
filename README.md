@@ -1,161 +1,142 @@
-# Scribetray
+<p align="center">
+  <img src="docs/media/banner.png" alt="Scribetray: speak into any text field on Windows" width="100%">
+</p>
 
-Scribetray is a Windows tray dictation app. Press a global hotkey, speak, and
-let ElevenLabs Scribe insert the transcript into the field that had focus when
-recording began.
+<p align="center">
+  <b>Press a hotkey, talk, and your words appear where your cursor is.</b><br>
+  A tiny Windows tray app powered by <a href="https://elevenlabs.io/speech-to-text">ElevenLabs Scribe</a>.
+</p>
 
-## Build and run
+<p align="center">
+  <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white">
+  <img alt="Written in Rust" src="https://img.shields.io/badge/Rust-1.85%2B-B7410E?logo=rust&logoColor=white">
+  <img alt="License: WTFPL" src="https://img.shields.io/badge/license-WTFPL-2EA44F">
+</p>
 
-Requirements: Rust 1.85 or newer and the Windows MSVC toolchain.
+---
 
-```powershell
-.\scripts\deploy-latest.ps1
-& "$env:LOCALAPPDATA\Scribetray\builds\latest\scribetray.exe"
-```
+Typing a long prompt to an AI agent, answering a chat, writing a commit message: most of what we type we could just *say*. Scribetray lets you do that in any app, without switching windows or copying anything.
 
-The deployment script runs Cargo's locked release build, copies the executable
-to a versioned directory outside the repository, switches the stable `latest`
-junction, and prunes older builds. It leaves running builds in place. Build
-while Scribetray is open, then close and relaunch it through the stable path to
-run the new version.
+1. Put your cursor in a text field.
+2. Press **Win+Alt+V** and speak. A small waveform floats next to your cursor so you know it's listening.
+3. Press **Win+Alt+V** again. A moment later the text is typed in, right where you left it.
 
-The default build root is `%LOCALAPPDATA%\Scribetray\builds`; the newest three
-builds are retained. Override these per invocation with
-`-BuildRoot 'D:\Apps\Scribetray\builds' -KeepBuilds 5`. The script also
-accepts Cargo's `-Target` and `-CargoArgs` parameters, for example
-`-CargoArgs @('--jobs', '4')`. Persistent defaults can go in
-`%APPDATA%\Scribetray\deploy.json`:
+Press **Enter** instead to insert the text *and send it*, which is handy in chat boxes and AI prompts. Press **Esc** to throw the recording away.
 
-```json
-{
-  "buildRoot": "D:\\Apps\\Scribetray\\builds",
-  "keepBuilds": 5,
-  "target": "x86_64-pc-windows-msvc",
-  "cargoArgs": ["--jobs", "4"]
-}
-```
+<p align="center">
+  <img src="docs/media/overlay-recording.gif" alt="The recording overlay: a small pill with a live waveform" width="330">
+</p>
 
-Command-line parameters take precedence over the `SCRIBETRAY_BUILD_ROOT`,
-`SCRIBETRAY_KEEP_BUILDS`, and `SCRIBETRAY_TARGET` environment variables, which
-take precedence over JSON settings. The script uses Cargo for compilation and
-handles promotion and cleanup itself.
+## Why Scribetray
 
-The release executable embeds the Scribetray icon and a PerMonitorV2,
-`asInvoker` manifest. It creates its configuration on first launch at
-`%APPDATA%\Scribetray\config.toml`; logs and the last 20 recordings are stored
-under `%LOCALAPPDATA%\Scribetray`.
+- **Works everywhere you type.** Browsers, Electron apps, editors, chat clients. Scribetray types the text as keystrokes into the field that had focus when you started, so it doesn't depend on per-app integrations.
+- **Your clipboard stays yours.** Text is typed, not pasted. A paste mode exists for the rare field that prefers it, and it restores your clipboard afterwards.
+- **Nothing gets lost.** If you switched windows while it was transcribing, the text goes to the clipboard instead of into the wrong app. The last recordings stay on disk, so a failed upload can be retried and **one click on the tray icon** copies your last dictation.
+- **Honest about what it did.** By default every dictation starts with 🎙️, so whoever reads it (a colleague, or an AI agent) knows it was spoken and may contain a transcription slip. You can turn this off in the menu.
+- **Accurate in many languages.** Scribe auto-detects the language, or you can pin one from the menu.
+- **Small and quiet.** A single native executable. No installer, no admin rights, no background service, no telemetry.
 
-## Use
+## Get started
 
-- **Win+Alt+V** starts or stops recording. While recording, **Enter** stops,
-  inserts the transcript, and submits it once. **Esc** cancels the current
-  recording. The tray menu can switch to push-to-talk, where holding the
-  configured toggle chord records until you release it.
-- Left-clicking the system-tray icon copies the newest recoverable dictation;
-  right-click opens the full menu.
-- The right-click menu shows ElevenLabs credit usage when the API key has
-  `user_read` permission. It refreshes at startup and when the menu opens with
-  a cache older than 10 minutes.
-- The tray menu can capture a new toggle hotkey and controls push-to-talk,
-  realtime transcription, microphone selection, the emoji prefix, Auto-Enter,
-  sound cues, typing mode, language, Start with Windows, and recording history.
-- **Open settings file…** opens the TOML config. Settings reload automatically
-  after saving the file, once any active recording ends. Supported hotkey keys
-  are letters, digits, F1–F24, Space, Enter, Tab, and Esc, with Win, Alt, Ctrl,
-  and Shift modifiers.
-- Failed uploads keep the PCM recording in history for retry. A focus change
-  before insertion sends the transcript to the clipboard instead.
-- History lists the 10 newest recoverable dictations with a transcript preview
-  and duration. A warning marks text that was copied instead of inserted;
-  failed recordings can be retried, and pending recordings are grayed out.
-- While recording, a compact non-activating pill follows the caret. Its waveform
-  reacts to the live microphone level; the tray icon and tooltip show recording,
-  transcription, setup, and error states.
+### 1. Get an ElevenLabs API key
 
-The app reads `ELEVENLABS_API_KEY` first, then `api_key` from the config file.
-Batch Scribe requests send `tag_audio_events=false`. Realtime mode opens a
-`scribe_v2_realtime` WebSocket when recording starts and commits the final audio
-chunk on stop. During longer recordings it commits segments every 25 seconds and
-joins their committed text, avoiding ElevenLabs' automatic segment boundary. If
-that session fails, Scribetray retries the complete saved audio through the batch
-`scribe_v2` endpoint. Realtime mode is off by default; turn it on in the tray
-menu to use it. Optional `keyterms` in the TOML config are sent as Scribe
-vocabulary hints. The websocket uses ElevenLabs'
-[realtime API](https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime);
-the API reference documents a 20% transcription premium for non-empty keyterm
-lists, so the default list is empty. New installations use Type mode by
-default: it simulates Unicode keystrokes and avoids relying on the clipboard.
-Use Paste mode from the tray menu for a field that handles paste better.
+Scribetray uses your own ElevenLabs account, so there is no subscription to Scribetray itself.
 
-Example settings:
+1. [Sign up at ElevenLabs](https://elevenlabs.io/app/sign-up). The free plan includes 10,000 credits a month, enough to try Scribetray properly.
+2. Open **Developers → API Keys → Create API key**.
+3. Turn on **Restrict key** and enable only:
+   - **Speech to Text**, required.
+   - **User → Read**, optional. It lets the tray menu show how much of your monthly allowance you've used.
+
+### 2. Download and run
+
+Download `scribetray.exe` from the [latest GitHub release](https://github.com/colthreepv/scribetray/releases/latest) and put it somewhere permanent, for example `%LOCALAPPDATA%\Programs\Scribetray\`. Then run it.
+
+> [!NOTE]
+> The executable isn't code-signed yet, so Windows SmartScreen may warn you the first time. Choose **More info → Run anyway**. You can also [build it yourself](#build-from-source).
+
+### 3. Add your key
+
+The tray icon appears faded until Scribetray has a key. Right-click it, choose **Set API key…**, and paste the key into `api_key = "..."`. Save the file and you're done; Scribetray picks up the change immediately.
+
+Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
+
+## Everyday use
+
+| Key | While idle | While recording |
+|---|---|---|
+| **Win+Alt+V** | Start recording | Stop and insert |
+| **Enter** | (untouched) | Stop, insert, and send |
+| **Esc** | (untouched) | Cancel |
+
+**The tray icon** shows what's happening: a coral wave when ready, blue while recording, amber while transcribing, and a red × if something failed.
+
+<p align="center">
+  <img src="docs/media/tray-states.png" alt="Tray icon states on dark and light taskbars" width="520">
+</p>
+
+- **Left-click** the icon to copy your last dictation, or to retry it if it failed.
+- **Right-click** for the menu. From there you can choose the microphone and language, browse recent dictations, switch to push-to-talk, and change the hotkey. It also shows your ElevenLabs usage for the month.
+
+The tray menu also shows cached monthly usage and an estimate of remaining batch transcription time. Set `scribe_credits_per_hour` to tune that estimate; realtime usage is excluded.
+
+Scribetray listens only while recording. In realtime mode, audio streams to ElevenLabs as you speak; in batch mode, it is uploaded when you stop. Enter and Esc are claimed *only* while a recording is running.
+
+## What does it cost?
+
+Scribetray is free and open source. Transcription is billed by ElevenLabs to your account. The free plan's monthly credits are enough to try it out, and after that Scribe costs roughly **$0.22 per hour of audio** on pay-as-you-go. A typical 30-second dictation costs a fraction of a cent. Current prices are on [ElevenLabs' pricing page](https://elevenlabs.io/pricing).
+
+## Privacy
+
+- Audio is sent to ElevenLabs only when you record, and only for transcription. See ElevenLabs' [privacy policy](https://elevenlabs.io/privacy-policy).
+- Your last 20 recordings (audio and text) are kept on your PC in `%LOCALAPPDATA%\Scribetray\history`, so that nothing is lost when something fails. Delete that folder any time.
+- Your API key is stored in plain text in `%APPDATA%\Scribetray\config.toml`. A restricted key limits what it can do if it ever leaks.
+- Scribetray talks only to ElevenLabs: transcription requests, plus a monthly usage check if your key allows it.
+
+## Settings
+
+Most options are in the tray menu. Everything else lives in `%APPDATA%\Scribetray\config.toml`, which reloads automatically when you save it:
 
 ```toml
-hotkey = "Win+Alt+V"
-mode = "toggle" # or "push_to_talk"
-realtime = false
-scribe_credits_per_hour = 585 # estimated batch Scribe credits spent per hour
-keyterms = []
-insert_method = "type" # or "paste"
+api_key = ""               # or set ELEVENLABS_API_KEY
+hotkey = "Win+Alt+V"       # letters, digits, F1–F24, Space, Tab… with Win/Alt/Ctrl/Shift
+mode = "toggle"            # or "push_to_talk": hold the hotkey while you speak
+model = "scribe_v2"
+language = "auto"          # or a language code such as "ita" or "eng"
+prefix = "🎙️ "
+prefix_enabled = true
+auto_enter = false         # also press Enter after every dictation
+insert_method = "type"     # or "paste"
+restore_clipboard = true
+max_seconds = 600          # a recording stops by itself after 10 minutes
+scribe_credits_per_hour = 585 # estimated batch Scribe credits per recording hour
+microphone = ""            # blank uses the Windows default input device
+realtime = false           # stream audio while you talk (costs more)
+keyterms = []              # words Scribe should expect, e.g. ["Scribetray", "Kubernetes"]
+sound_cues = true
+start_with_windows = false
 ```
 
-The tray menu shows cached ElevenLabs usage with a color-coded progress bar and
-an estimate of remaining batch Scribe time. `scribe_credits_per_hour` controls
-that estimate; the default is 585 credits/hour. Realtime usage is intentionally
-excluded from the estimate. The value can be changed in
-`%APPDATA%\Scribetray\config.toml`.
+## Good to know
 
-## Versioning
+- **Windows only**, by design: it relies on Windows APIs for hotkeys, caret tracking, and typing. It has been tested mostly on Windows 11.
+- **Apps running as administrator** can't receive typed text from a normal app (a Windows security rule). Run Scribetray as administrator too if you need that.
+- **The waveform follows your text cursor** in most apps. Where an app doesn't expose its cursor, it appears next to the mouse pointer instead.
+- **Terminals and games** may not handle typed Unicode text well. Paste mode can help.
 
-Release versions follow the implementation milestones: M0 was a disposable
-spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, recovery and send
-to `v0.4.x`, subscription usage to `v0.5.x`, and the usage header to `v0.6.x`.
-The current build is `v0.6.0`; patch numbers increase for fixes within the
-current milestone. The tray tooltip shows the running version.
+## Build from source
 
-Scribetray is a per-user desktop application and needs no installer or
-administrator rights. The deployment script keeps versioned builds under the
-user profile and updates the stable `latest` path. Settings and history are
-stored in the user's Windows profile. “Start with Windows” launches the
-executable path saved at the time it is enabled, so keep that path stable while
-using autostart. There is no Windows Service mode; Scribetray needs the
-interactive desktop for its tray icon, global hotkeys, microphone, and
-text-field insertion.
+You need Rust 1.85+ with the MSVC toolchain.
 
-## Implementation status
+```powershell
+git clone https://github.com/colthreepv/scribetray
+cd scribetray
+cargo build --release --locked
+.\target\release\scribetray.exe
+```
 
-The Rust application builds for `x86_64-pc-windows-msvc`; the UI registers the
-configured recording hotkey and registers Enter and Esc only while recording.
-The user has confirmed a realtime recording, transcription, and insertion
-round-trip in Codex App. Push-to-talk and the full target-app matrix still need
-a manual pass.
-The app includes
-WASAPI-backed capture through CPAL, batch and realtime Scribe transcription,
-push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
-clipboard-preserving paste, guarded Unicode typing, local history, retry,
-language selection, Enter-to-send while recording, optional Auto-Enter on stop,
-ElevenLabs usage with a native progress header and batch time estimate in the
-tray menu, a final-minute recording countdown, and per-user autostart.
+To run your own builds day to day, `scripts/deploy-latest.ps1` builds, keeps a few versioned copies, and points a stable `latest` path at the newest one. See [docs/development.md](docs/development.md).
 
-Earlier Codex App logs reported the mouse-position fallback; updated runs have
-reported both UIA `TextPattern` caret detection and mouse fallback. The user
-confirmed that a 46-second Realtime recording retained the full message; a
-local WebSocket test also verifies joining multiple committed segments.
-The user confirmed Auto-Enter works in Codex App and reported no noticeable
-speed penalty with Type mode. New installations now default to Type mode; the
-complete caret and insertion compatibility matrix across Codex App, Chrome,
-VS Code, Notepad, and Windows Terminal remains to be verified. Windows Terminal
-is a secondary compatibility check, not a primary dictation workflow.
+## License
 
-The tray menu groups recording and insertion settings, uses radio choices for
-mutually exclusive modes, shows the configured hotkeys, and previews recent
-history entries. Tray icons adapt to both app state and Windows taskbar theme.
-The overlay uses a DPI-scaled alpha-rendered waveform and reads the recorder's
-non-blocking live level meter.
-
-The latest desktop feedback reports that message-beep sound cues were inaudible,
-and that Paste mode can leave the clipboard replaced and skip Auto-Enter. The
-app now uses embedded WAV cues and restores the saved clipboard when the
-temporary transcript is still present, while preserving newer clipboard data.
-Right-click opens the tray menu; left-click copies or retries the newest
-recoverable dictation. Sound output and Chrome Paste-mode Auto-Enter still need
-a retest with the updated executable.
+Scribetray is distributed under the [Do What The Fuck You Want To Public License, Version 2 (WTFPL)](LICENSE). It is an independent project and is not affiliated with or endorsed by ElevenLabs.

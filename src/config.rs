@@ -20,6 +20,41 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_LANGUAGE_CODE: &str = "auto";
 pub const DEFAULT_MODEL: &str = "scribe_v2";
 
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Scribetray settings. Save this file to apply changes.
+# Create a restricted ElevenLabs API key with Speech to Text permission.
+# User → Read is optional and enables the usage header in the tray menu.
+# Alternatively, set ELEVENLABS_API_KEY in your environment.
+api_key = ""
+
+# Global recording shortcut. Supported modifiers: Win, Alt, Ctrl, Shift.
+hotkey = "Win+Alt+V"
+# Recording mode: "toggle" or "push_to_talk".
+mode = "toggle"
+# Stream audio while recording. Realtime transcription costs more than batch.
+realtime = false
+# Optional vocabulary hints sent to Scribe; an empty list is the default.
+keyterms = []
+# Speech-to-text model and language detection preference.
+model = "scribe_v2"
+language = "auto"
+# Prefix inserted before each transcript when enabled.
+prefix = "🎙️ "
+prefix_enabled = true
+# Submit the text after insertion for every recording.
+auto_enter = false
+# Insert transcripts by simulated typing or clipboard paste.
+insert_method = "type"
+restore_clipboard = true
+# Maximum recording duration, in seconds.
+max_seconds = 600
+# Approximate batch Scribe credits consumed per recorded hour; tune for your plan.
+scribe_credits_per_hour = 585
+# Leave blank to use the Windows default microphone.
+microphone = ""
+sound_cues = true
+start_with_windows = false
+"#;
+
 /// Settings persisted for the Scribetray desktop application.
 ///
 /// `api_key` is deliberately redacted from `Debug` output.
@@ -122,7 +157,7 @@ impl Config {
             Ok(contents) => Ok(toml::from_str(&contents)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let config = Self::default();
-                let contents = toml::to_string_pretty(&config)?;
+                let contents = DEFAULT_CONFIG_TEMPLATE;
                 let parent = path.parent().ok_or(ConfigError::UnavailableDirectory)?;
                 fs::create_dir_all(parent)?;
 

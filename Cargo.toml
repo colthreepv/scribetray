@@ -1,9 +1,13 @@
 [package]
 name = "scribetray"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Windows system-tray dictation powered by ElevenLabs Scribe"
+license = "WTFPL"
+repository = "https://github.com/colthreepv/scribetray"
+readme = "README.md"
+keywords = ["dictation", "speech-to-text", "elevenlabs", "windows", "tray"]
 default-run = "scribetray"
 build = "build.rs"
 

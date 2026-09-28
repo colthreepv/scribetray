@@ -20,7 +20,7 @@ fn main() {
             ("tray-off-light", "11"),
         ];
         for (name, id) in TRAY_ICONS {
-            resource.set_icon_with_id(&format!("design/ui-refresh/out/tray/{name}.ico"), id);
+            resource.set_icon_with_id(&format!("assets/tray/{name}.ico"), id);
         }
         resource
             .compile()

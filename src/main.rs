@@ -251,6 +251,13 @@ fn run() -> Result<(), String> {
     let mut ui_settings =
         make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
     let ui = UiRuntime::start(ui_settings.clone())?;
+    if config.resolved_api_key().is_none() {
+        show_notice(
+            &ui,
+            "Scribetray setup",
+            "Scribetray needs an ElevenLabs API key. Right-click the tray icon and choose Set API key…",
+        );
+    }
     let (worker_tx, worker_rx) = mpsc::channel();
     let (subscription_tx, subscription_rx) = mpsc::channel();
     let mut subscription_cache = SubscriptionCache::default();
