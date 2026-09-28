@@ -1,6 +1,6 @@
 # Scribetray — usage header (v0.6)
 
-Everything in the v0.5 plan has shipped (`7416b4f`, `255b6c4`): the usage line, the final-minute countdown, and the hollow push-to-talk dot. This file lists only what is still open. Implement it as written, in this order.
+Everything in the v0.5 plan has shipped (`7416b4f`, `255b6c4`): the usage line, the final-minute countdown, and the hollow push-to-talk dot. The v0.6 implementation shipped in `v0.6.0` (`c9279e2`). This file preserves its specification; only the visual acceptance check at 100% and 150% scaling remains open.
 
 ## 1. Bug: the usage line disappears after the first menu open
 
@@ -50,4 +50,3 @@ Layout (DIPs, 300 wide × 64 high, scaled by the tray window DPI):
 - Keep the existing refresh rules: fetch at startup; when the menu opens, refresh in the background if the value is older than 10 minutes; the menu never waits. The header is hidden only when no value has ever been fetched for the current key, or the key lacks `user_read`.
 
 Accept: at 100 % and 150 % scaling the header matches the mockup, text isn't clipped, and clicking it does nothing. With the current account it reads `≈ 37 h left` and `1,09x / 23,130 credits · resets Oct 6`.
-
