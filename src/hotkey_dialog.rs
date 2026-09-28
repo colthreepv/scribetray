@@ -107,7 +107,11 @@ pub fn capture_hotkey(owner_hwnd: isize) -> Result<Option<String>, String> {
     }
 
     let mut pump_error = None;
-    while !session.state.finished {
+    // The window procedure sets `finished` through `state_ptr` while messages
+    // are dispatched, so read it through the same pointer. Clippy cannot see
+    // that mutation inside DispatchMessageW.
+    #[allow(clippy::while_immutable_condition)]
+    while !unsafe { (*state_ptr).finished } {
         let mut message = MSG::default();
         let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 < 0 {
