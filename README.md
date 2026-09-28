@@ -9,9 +9,36 @@ recording began.
 Requirements: Rust 1.85 or newer and the Windows MSVC toolchain.
 
 ```powershell
-cargo build --release
-.\target\release\scribetray.exe
+.\scripts\deploy-latest.ps1
+& "$env:LOCALAPPDATA\Scribetray\builds\latest\scribetray.exe"
 ```
+
+The deployment script runs Cargo's locked release build, copies the executable
+to a versioned directory outside the repository, switches the stable `latest`
+junction, and prunes older builds. It leaves running builds in place. Build
+while Scribetray is open, then close and relaunch it through the stable path to
+run the new version.
+
+The default build root is `%LOCALAPPDATA%\Scribetray\builds`; the newest three
+builds are retained. Override these per invocation with
+`-BuildRoot 'D:\Apps\Scribetray\builds' -KeepBuilds 5`. The script also
+accepts Cargo's `-Target` and `-CargoArgs` parameters, for example
+`-CargoArgs @('--jobs', '4')`. Persistent defaults can go in
+`%APPDATA%\Scribetray\deploy.json`:
+
+```json
+{
+  "buildRoot": "D:\\Apps\\Scribetray\\builds",
+  "keepBuilds": 5,
+  "target": "x86_64-pc-windows-msvc",
+  "cargoArgs": ["--jobs", "4"]
+}
+```
+
+Command-line parameters take precedence over the `SCRIBETRAY_BUILD_ROOT`,
+`SCRIBETRAY_KEEP_BUILDS`, and `SCRIBETRAY_TARGET` environment variables, which
+take precedence over JSON settings. The script uses Cargo for compilation and
+handles promotion and cleanup itself.
 
 The release executable embeds the Scribetray icon and a PerMonitorV2,
 `asInvoker` manifest. It creates its configuration on first launch at
@@ -75,16 +102,17 @@ insert_method = "type" # or "paste"
 Release versions follow the implementation milestones: M0 was a disposable
 spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, recovery and send
 to `v0.4.x`, and subscription usage to `v0.5.x`. The current build is
-`v0.5.0`; patch numbers increase for fixes within the current milestone. The
+`v0.5.1`; patch numbers increase for fixes within the current milestone. The
 tray tooltip shows the running version.
 
 Scribetray is a per-user desktop application and needs no installer or
-administrator rights. It can run directly from this repository's
-`target/release/scribetray.exe`; settings and history are stored in the user's
-Windows profile. “Start with Windows” launches the executable path saved at
-the time it is enabled, so keep that path stable while using autostart. There
-is no Windows Service mode; Scribetray needs the interactive desktop for its
-tray icon, global hotkeys, microphone, and text-field insertion.
+administrator rights. The deployment script keeps versioned builds under the
+user profile and updates the stable `latest` path. Settings and history are
+stored in the user's Windows profile. “Start with Windows” launches the
+executable path saved at the time it is enabled, so keep that path stable while
+using autostart. There is no Windows Service mode; Scribetray needs the
+interactive desktop for its tray icon, global hotkeys, microphone, and
+text-field insertion.
 
 ## Implementation status
 
