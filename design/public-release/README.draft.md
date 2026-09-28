@@ -89,7 +89,7 @@ Scribetray is free and open source. Transcription is billed by ElevenLabs to you
 - Audio is sent to ElevenLabs only when you record, and only for transcription. See ElevenLabs' [privacy policy](https://elevenlabs.io/privacy-policy).
 - Your last 20 recordings (audio and text) are kept on your PC in `%LOCALAPPDATA%\Scribetray\history`, so that nothing is lost when something fails. Delete that folder any time.
 - Your API key is stored in plain text in `%APPDATA%\Scribetray\config.toml`. A restricted key limits what it can do if it ever leaks.
-- Scribetray makes no other network requests.
+- Scribetray talks only to ElevenLabs: transcription requests, plus a monthly usage check if your key allows it.
 
 ## Settings
 
@@ -134,4 +134,3 @@ To run your own builds day to day, `scripts/deploy-latest.ps1` builds, keeps a f
 ## License
 
 MIT. Scribetray is an independent project and isn't affiliated with or endorsed by ElevenLabs.
-

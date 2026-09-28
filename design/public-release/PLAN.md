@@ -22,7 +22,7 @@ Audit already done (2026-09-28): the tracked files contain no private paths or c
 - Move the developer-oriented content from the current README into `docs/development.md`: `deploy-latest.ps1` usage and `deploy.json`, realtime segmenting and batch fallback, the versioning scheme, caret detection notes, and autostart path stability. Don't carry over the "Implementation status" section.
 - Add `LICENSE` (MIT, © 2026 Valerio Coltre) and `license = "MIT"`, `repository`, `readme`, `keywords` (`dictation`, `speech-to-text`, `elevenlabs`, `windows`, `tray`) in `Cargo.toml`.
 - Add `CHANGELOG.md`, one short paragraph per minor version from the git log (v0.1 to the current version).
-- Check before publishing: the free-plan allowance and the $0.22/hour pay-as-you-go price on [elevenlabs.io/pricing](https://elevenlabs.io/pricing). The README deliberately gives no hour count for the free plan. ElevenLabs quotes about 12 minutes of Scribe in the web app and about half an hour through the API; on this pay-as-you-go account we measured about 585 credits per hour. Keep the wording vague unless it's verified.
+- Check before publishing: the free-plan allowance (10,000 credits/month) and the $0.22/hour pay-as-you-go price on [elevenlabs.io/pricing](https://elevenlabs.io/pricing). The README deliberately gives no hour count for the free plan, because credits per hour differ by plan (this pay-as-you-go account measured about 585 credits per hour). Add an hour figure only if ElevenLabs states one for API usage on the free plan.
 - Check that every setting in the README's TOML block exists in `config.rs` with that default.
 
 ### 3. First-run experience (small code changes that make the README true)
@@ -55,4 +55,3 @@ For planning only; don't start with M1.
 
 1. License: MIT is proposed. Say so if you prefer `MIT OR Apache-2.0` (common in Rust) or something else.
 2. The 🎙️ prefix stays on by default and is presented as a feature. Turning it off by default is the alternative.
-
