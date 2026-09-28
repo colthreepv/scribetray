@@ -25,6 +25,15 @@ pub enum UsageError {
     ClientInitialization,
 }
 
+/// Raw usage information needed to render the tray's usage header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub used: u64,
+    pub limit: u64,
+    pub reset_unix: Option<i64>,
+    pub overage: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SubscriptionResponse {
     character_count: u64,
@@ -40,8 +49,8 @@ struct CurrentOverage {
     amount: String,
 }
 
-/// Retrieves and formats usage without exposing API-key material in errors.
-pub fn fetch_usage_line(api_key: &str) -> Result<String, UsageError> {
+/// Retrieves usage without exposing API-key material in errors.
+pub fn fetch_usage(api_key: &str) -> Result<UsageSnapshot, UsageError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -62,40 +71,22 @@ pub fn fetch_usage_line(api_key: &str) -> Result<String, UsageError> {
         .json::<SubscriptionResponse>()
         .map_err(|_| UsageError::InvalidResponse)?;
 
-    let percent = if subscription.character_limit == 0 {
-        0
-    } else {
-        ((subscription.character_count as f64 / subscription.character_limit as f64) * 100.0)
-            .round() as u64
-    };
-    let mut line = format!(
-        "ElevenLabs: {} / {} credits ({}%)",
-        grouped(subscription.character_count),
-        grouped(subscription.character_limit),
-        percent
-    );
-    if let Some(reset) = subscription
-        .next_character_count_reset_unix
-        .and_then(format_reset_date)
-    {
-        line.push_str(" · resets ");
-        line.push_str(&reset);
-    }
-    if let Some(overage) = subscription.current_overage {
-        if overage
-            .amount
-            .trim()
+    let overage = subscription.current_overage.and_then(|overage| {
+        let amount = overage.amount.trim();
+        amount
             .parse::<f64>()
             .is_ok_and(|amount| amount.is_finite() && amount != 0.0)
-        {
-            line.push_str(" · overage $");
-            line.push_str(overage.amount.trim());
-        }
-    }
-    Ok(line)
+            .then(|| amount.to_owned())
+    });
+    Ok(UsageSnapshot {
+        used: subscription.character_count,
+        limit: subscription.character_limit,
+        reset_unix: subscription.next_character_count_reset_unix,
+        overage,
+    })
 }
 
-fn grouped(value: u64) -> String {
+pub fn format_count(value: u64) -> String {
     let digits = value.to_string();
     let first_group = match digits.len() % 3 {
         0 => 3,
@@ -110,7 +101,7 @@ fn grouped(value: u64) -> String {
     grouped
 }
 
-fn format_reset_date(unix_seconds: i64) -> Option<String> {
+pub fn format_reset_date(unix_seconds: i64) -> Option<String> {
     let ticks = u64::try_from(unix_seconds)
         .ok()?
         .checked_mul(10_000_000)?

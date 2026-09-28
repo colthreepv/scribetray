@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::subscription::{UsageSnapshot, format_count, format_reset_date};
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
 };
@@ -27,18 +28,23 @@ use windows::{
         },
         Graphics::Gdi::{
             AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
-            BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-            DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_DONTCARE,
-            FW_SEMIBOLD, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, GetTextFaceW,
-            GetTextMetricsW, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-            MonitorFromRect, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-            TEXTMETRICW, TRANSPARENT, TextOutW,
+            BLENDFUNCTION, CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_MENU, COLOR_MENUTEXT,
+            CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreateFontW, CreatePen,
+            CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS,
+            DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+            FF_DONTCARE, FW_SEMIBOLD, FillRect, GetDC, GetMonitorInfoW, GetSysColor,
+            GetSysColorBrush, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, HBRUSH, HDC,
+            HFONT, HGDIOBJ, HPEN, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+            OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+            SetTextColor, TEXTMETRICW, TRANSPARENT, TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
         UI::{
-            Controls::{LIM_SMALL, LoadIconMetric},
-            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+            Controls::{DRAWITEMSTRUCT, LIM_SMALL, LoadIconMetric, MEASUREITEMSTRUCT, ODT_MENU},
+            HiDpi::{
+                GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI, SystemParametersInfoForDpi,
+            },
             Input::KeyboardAndMouse::{
                 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
                 UnregisterHotKey, VK_ESCAPE, VK_RETURN,
@@ -52,17 +58,19 @@ use windows::{
                 AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
                 DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
                 GetCursorPos, GetMessageW, GetWindowLongPtrW, HHOOK, HICON, HWND_TOPMOST,
-                IDI_APPLICATION, KBDLLHOOKSTRUCT, KillTimer, LoadIconW, MF_CHECKED, MF_POPUP,
-                MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE,
+                IDI_APPLICATION, InsertMenuItemW, KBDLLHOOKSTRUCT, KillTimer, LoadIconW,
+                MENUITEMINFOW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MFS_DISABLED,
+                MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE, NONCLIENTMETRICSW,
+                PostMessageW, PostQuitMessage, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_HIDE,
                 SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
                 SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW,
                 ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
                 TranslateMessage, ULW_ALPHA, UnhookWindowsHookEx, UnregisterClassW,
                 UpdateLayeredWindow, WH_KEYBOARD_LL, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
-                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
-                WM_NCCREATE, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-                WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-                WS_POPUP,
+                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+                WM_LBUTTONUP, WM_MEASUREITEM, WM_NCCREATE, WM_RBUTTONUP, WM_SETTINGCHANGE,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
@@ -86,6 +94,8 @@ const TIMER_OVERLAY_METER: usize = 0x5345;
 const OVERLAY_ANIMATION_MS: u32 = 33;
 const OVERLAY_METER_MS: u32 = 50;
 const OVERLAY_RECORDING_TICK_MS: u32 = 1000;
+const USAGE_HEADER_WIDTH_DIP: i32 = 300;
+const USAGE_HEADER_HEIGHT_DIP: i32 = 64;
 
 /// Caret overlay geometry in device-independent pixels, scaled per monitor.
 const PILL_WIDTH_DIP: f32 = 58.0;
@@ -110,6 +120,10 @@ const OVERLAY_FADE_IN_SECONDS: f32 = 0.12;
 const OVERLAY_ERROR_HOLD_SECONDS: f32 = 2.0;
 const OVERLAY_ERROR_FADE_SECONDS: f32 = 0.2;
 const DEFAULT_DPI: f32 = 96.0;
+const USAGE_TRACK_RGB: (u8, u8, u8) = (0xE0, 0xE0, 0xE0);
+const USAGE_NORMAL_RGB: (u8, u8, u8) = (0xF0, 0x56, 0x4A);
+const USAGE_WARN_RGB: (u8, u8, u8) = (0xF5, 0xA5, 0x24);
+const USAGE_CRITICAL_RGB: (u8, u8, u8) = (0xDC, 0x26, 0x26);
 
 /// Colors taken verbatim from `design/ui-refresh/overlay-prototype.html`.
 const REC_RGB: (u8, u8, u8) = (0xF0, 0x44, 0x38);
@@ -300,8 +314,8 @@ pub struct UiSettings {
     pub realtime_enabled: bool,
     /// Whether an ElevenLabs API key is resolved from the environment or config.
     pub api_key_configured: bool,
-    /// Cached ElevenLabs usage text shown at the top of the tray menu.
-    pub subscription_line: Option<String>,
+    /// Estimated batch Scribe credits spent per recording hour.
+    pub scribe_credits_per_hour: u32,
     pub selected_microphone: Option<String>,
     pub microphones: Vec<String>,
     pub prefix_enabled: bool,
@@ -322,7 +336,7 @@ impl Default for UiSettings {
             max_seconds: 600,
             realtime_enabled: false,
             api_key_configured: false,
-            subscription_line: None,
+            scribe_credits_per_hour: 585,
             selected_microphone: None,
             microphones: Vec::new(),
             prefix_enabled: true,
@@ -418,7 +432,7 @@ pub enum UiEvent {
 #[derive(Clone, Debug)]
 pub enum UiCommand {
     SetSettings(UiSettings),
-    SetSubscriptionLine(Option<String>),
+    SetUsage(Option<UsageSnapshot>),
     UpdateHistory(Vec<HistoryMenuItem>),
     SetRecording(bool),
     /// Live input level for the overlay waveform; `None` when not capturing.
@@ -518,6 +532,7 @@ struct UiState {
     commands: Receiver<UiCommand>,
     events: Sender<UiEvent>,
     settings: UiSettings,
+    usage: Option<UsageSnapshot>,
     tray_hwnd: HWND,
     overlay_hwnd: HWND,
     instance: HINSTANCE,
@@ -643,6 +658,7 @@ fn create_ui_state(
         commands,
         events,
         settings,
+        usage: None,
         tray_hwnd: HWND::default(),
         overlay_hwnd: HWND::default(),
         instance,
@@ -881,7 +897,7 @@ impl UiState {
                 }
                 self.refresh_tray();
             }
-            UiCommand::SetSubscriptionLine(line) => self.settings.subscription_line = line,
+            UiCommand::SetUsage(usage) => self.usage = usage,
             UiCommand::UpdateHistory(history) => self.settings.history = history,
             UiCommand::SetRecording(recording) => {
                 self.set_recording(recording);
@@ -1178,13 +1194,27 @@ impl UiState {
         self.clear_tray_error();
         self.refresh_tray();
         self.handle_user_event(UiEvent::UsageRefreshRequested);
-        let (menu, actions) = match build_tray_menu(&self.settings, self.recording) {
-            Ok(menu) => menu,
-            Err(error) => {
-                self.show_notice(TITLE, &format!("Could not build tray menu: {error}"));
-                return;
-            }
-        };
+        let usage_header = self.usage.as_ref().map(|usage| {
+            UsageHeaderDrawData::new(
+                usage,
+                self.settings.scribe_credits_per_hour,
+                self.settings.realtime_enabled,
+                tray_menu_dpi(self.tray_hwnd),
+            )
+        });
+        // Keep this stack value alive until TrackPopupMenu returns; its address
+        // is carried by dwItemData for the owner's measure/draw callbacks.
+        let usage_header_data = usage_header
+            .as_ref()
+            .map(|header| std::ptr::from_ref(header) as usize);
+        let (menu, actions) =
+            match build_tray_menu(&self.settings, self.recording, usage_header_data) {
+                Ok(menu) => menu,
+                Err(error) => {
+                    self.show_notice(TITLE, &format!("Could not build tray menu: {error}"));
+                    return;
+                }
+            };
         let mut cursor = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut cursor);
@@ -1564,9 +1594,300 @@ impl Drop for MenuGuard {
     }
 }
 
+struct UsageHeaderDrawData {
+    dpi: u32,
+    hours: Option<String>,
+    details: String,
+    usage_ratio: f64,
+}
+
+impl UsageHeaderDrawData {
+    fn new(usage: &UsageSnapshot, credits_per_hour: u32, realtime: bool, dpi: u32) -> Self {
+        let mut details = format!(
+            "{} / {} credits",
+            format_count(usage.used),
+            format_count(usage.limit)
+        );
+        if let Some(reset) = usage.reset_unix.and_then(format_reset_date) {
+            details.push_str(" · resets ");
+            details.push_str(&reset);
+        }
+        if let Some(overage) = &usage.overage {
+            details.push_str(" · overage $");
+            details.push_str(overage);
+        }
+
+        let usage_ratio = if usage.limit == 0 {
+            if usage.used > 0 { 1.0 } else { 0.0 }
+        } else {
+            (usage.used as f64 / usage.limit as f64).clamp(0.0, 1.0)
+        };
+        Self {
+            dpi,
+            hours: (!realtime).then(|| estimate_hours_remaining(usage, credits_per_hour)),
+            details,
+            usage_ratio,
+        }
+    }
+}
+
+fn estimate_hours_remaining(usage: &UsageSnapshot, credits_per_hour: u32) -> String {
+    let remaining = usage.limit.saturating_sub(usage.used);
+    if remaining == 0 || credits_per_hour == 0 {
+        return "no credits left".to_owned();
+    }
+    let hours = remaining as f64 / f64::from(credits_per_hour);
+    if hours >= 10.0 {
+        format!("≈ {} h left", hours.floor() as u64)
+    } else if hours >= 1.0 {
+        let whole_hours = hours.floor() as u64;
+        let minutes = (((hours - whole_hours as f64) * 60.0) as u64 / 10) * 10;
+        format!("≈ {whole_hours} h {minutes} m left")
+    } else {
+        let minutes = (hours * 60.0).round().clamp(1.0, 59.0) as u64;
+        format!("≈ {minutes} m left")
+    }
+}
+
+fn tray_menu_dpi(hwnd: HWND) -> u32 {
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+        let rect = RECT {
+            left: cursor.x,
+            top: cursor.y,
+            right: cursor.x.saturating_add(1),
+            bottom: cursor.y.saturating_add(1),
+        };
+        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
+        if !monitor.0.is_null() {
+            let mut x_dpi = 0;
+            let mut y_dpi = 0;
+            if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x_dpi, &mut y_dpi) }
+                .is_ok()
+                && x_dpi > 0
+            {
+                return x_dpi;
+            }
+        }
+    }
+    unsafe { GetDpiForWindow(hwnd) }.max(1)
+}
+
+fn scale_menu_dip(value: i32, dpi: u32) -> i32 {
+    ((i64::from(value) * i64::from(dpi) + 48) / 96) as i32
+}
+
+unsafe fn measure_usage_header(item: &mut MEASUREITEMSTRUCT) -> bool {
+    if item.CtlType != ODT_MENU || item.itemData == 0 {
+        return false;
+    }
+    // SAFETY: this menu item stores a pointer to the UsageHeaderDrawData local
+    // kept alive by show_menu for the full TrackPopupMenu call.
+    let header = unsafe { &*(item.itemData as *const UsageHeaderDrawData) };
+    item.itemWidth = scale_menu_dip(USAGE_HEADER_WIDTH_DIP, header.dpi) as u32;
+    item.itemHeight = scale_menu_dip(USAGE_HEADER_HEIGHT_DIP, header.dpi) as u32;
+    true
+}
+
+unsafe fn draw_usage_header(item: &DRAWITEMSTRUCT) -> bool {
+    if item.CtlType != ODT_MENU || item.itemData == 0 || item.hDC.0.is_null() {
+        return false;
+    }
+    // SAFETY: this menu item stores a pointer to the UsageHeaderDrawData local
+    // kept alive by show_menu for the full TrackPopupMenu call.
+    let header = unsafe { &*(item.itemData as *const UsageHeaderDrawData) };
+    let dpi = header.dpi.max(1);
+    let scale = |value| scale_menu_dip(value, dpi);
+    let rect = item.rcItem;
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    let background = unsafe { GetSysColorBrush(COLOR_MENU) };
+    unsafe { FillRect(item.hDC, &rect, background) };
+
+    let mut metrics = NONCLIENTMETRICSW {
+        cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let got_metrics = unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            metrics.cbSize,
+            Some((&mut metrics as *mut NONCLIENTMETRICSW).cast()),
+            0,
+            dpi,
+        )
+    }
+    .is_ok();
+    let mut menu_font = if got_metrics {
+        metrics.lfMenuFont
+    } else {
+        fallback_menu_font(dpi)
+    };
+    let normal_font = unsafe { CreateFontIndirectW(&menu_font) };
+    menu_font.lfWeight = FW_SEMIBOLD.0 as i32;
+    let semibold_font = unsafe { CreateFontIndirectW(&menu_font) };
+    let old_mode = unsafe { SetBkMode(item.hDC, TRANSPARENT) };
+    let old_font = if !semibold_font.0.is_null() {
+        unsafe { SelectObject(item.hDC, HGDIOBJ(semibold_font.0)) }
+    } else if !normal_font.0.is_null() {
+        unsafe { SelectObject(item.hDC, HGDIOBJ(normal_font.0)) }
+    } else {
+        HGDIOBJ::default()
+    };
+    let menu_color = COLORREF(unsafe { GetSysColor(COLOR_MENUTEXT) });
+    let old_text_color = unsafe { SetTextColor(item.hDC, menu_color) };
+
+    let padding = scale(12);
+    let top_row = RECT {
+        left: rect.left + padding,
+        top: rect.top + scale(6),
+        right: rect.right - padding,
+        bottom: rect.top + scale(26),
+    };
+    let mut title_rect = top_row;
+    title_rect.right = rect.left + width / 2;
+    let mut title = "ElevenLabs".encode_utf16().collect::<Vec<_>>();
+    unsafe {
+        DrawTextW(
+            item.hDC,
+            &mut title,
+            &mut title_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+    if let Some(hours) = &header.hours {
+        let mut hour_rect = top_row;
+        hour_rect.left = rect.left + width / 2;
+        let mut hours = hours.encode_utf16().collect::<Vec<_>>();
+        unsafe {
+            DrawTextW(
+                item.hDC,
+                &mut hours,
+                &mut hour_rect,
+                DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+    }
+
+    if !normal_font.0.is_null() {
+        unsafe { SelectObject(item.hDC, HGDIOBJ(normal_font.0)) };
+    }
+    let gray_color = COLORREF(unsafe { GetSysColor(COLOR_GRAYTEXT) });
+    unsafe { SetTextColor(item.hDC, gray_color) };
+    let track_left = rect.left + padding;
+    let track_top = rect.top + scale(29);
+    let track_width = (width - 2 * padding).max(1);
+    let track_height = scale(4).max(1);
+    draw_usage_round_rect(
+        item.hDC,
+        track_left,
+        track_top,
+        track_left + track_width,
+        track_top + track_height,
+        scale(2),
+        rgb_color(USAGE_TRACK_RGB),
+    );
+    if header.usage_ratio > 0.0 {
+        let minimum = scale(4).min(track_width);
+        let fill_width = ((track_width as f64 * header.usage_ratio).round() as i32)
+            .max(minimum)
+            .min(track_width);
+        let fill_color = if header.usage_ratio >= 0.95 {
+            USAGE_CRITICAL_RGB
+        } else if header.usage_ratio >= 0.80 {
+            USAGE_WARN_RGB
+        } else {
+            USAGE_NORMAL_RGB
+        };
+        draw_usage_round_rect(
+            item.hDC,
+            track_left,
+            track_top,
+            track_left + fill_width,
+            track_top + track_height,
+            scale(2),
+            rgb_color(fill_color),
+        );
+    }
+
+    let mut details_rect = RECT {
+        left: rect.left + padding,
+        top: rect.top + scale(40),
+        right: rect.right - padding,
+        bottom: rect.top + height - scale(3),
+    };
+    let mut details = header.details.encode_utf16().collect::<Vec<_>>();
+    unsafe {
+        DrawTextW(
+            item.hDC,
+            &mut details,
+            &mut details_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+
+    unsafe {
+        if !old_font.0.is_null() {
+            SelectObject(item.hDC, old_font);
+        }
+        SetTextColor(item.hDC, old_text_color);
+        SetBkMode(
+            item.hDC,
+            windows::Win32::Graphics::Gdi::BACKGROUND_MODE(old_mode as u32),
+        );
+        if !normal_font.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(normal_font.0));
+        }
+        if !semibold_font.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(semibold_font.0));
+        }
+    }
+    true
+}
+
+fn fallback_menu_font(dpi: u32) -> windows::Win32::Graphics::Gdi::LOGFONTW {
+    use windows::Win32::Graphics::Gdi::LOGFONTW;
+    let mut font = LOGFONTW {
+        lfHeight: -scale_menu_dip(12, dpi),
+        lfWeight: 400,
+        ..Default::default()
+    };
+    for (target, source) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
+        *target = source;
+    }
+    font
+}
+
+fn rgb_color((red, green, blue): (u8, u8, u8)) -> COLORREF {
+    COLORREF(u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16))
+}
+
+fn draw_usage_round_rect(
+    hdc: HDC,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    radius: i32,
+    color: COLORREF,
+) {
+    let brush: HBRUSH = unsafe { CreateSolidBrush(color) };
+    let pen: HPEN = unsafe { CreatePen(PS_SOLID, 0, color) };
+    let old_brush = unsafe { SelectObject(hdc, HGDIOBJ(brush.0)) };
+    let old_pen = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
+    unsafe {
+        let _ = RoundRect(hdc, left, top, right, bottom, radius * 2, radius * 2);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+}
+
 fn build_tray_menu(
     settings: &UiSettings,
     recording: bool,
+    usage_header_data: Option<usize>,
 ) -> Result<(MenuGuard, HashMap<u32, UiEvent>), String> {
     use windows::Win32::UI::WindowsAndMessaging::MF_GRAYED;
 
@@ -1576,8 +1897,19 @@ fn build_tray_menu(
     let setup_ready = settings.api_key_configured;
     let toggle_label = settings.toggle_hotkey.combo_label();
 
-    if let Some(line) = settings.subscription_line.as_deref() {
-        append_flags(root.0, MF_STRING | MF_GRAYED, 0, line)?;
+    if let Some(item_data) = usage_header_data {
+        let item = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE | MIIM_STATE | MIIM_DATA | MIIM_ID,
+            fType: MFT_OWNERDRAW,
+            fState: MFS_DISABLED,
+            wID: 0,
+            dwItemData: item_data,
+            ..Default::default()
+        };
+        unsafe { InsertMenuItemW(root.0, 0, true, &item) }
+            .map_err(|error| format!("could not add the usage header: {error}"))?;
+        append_separator(root.0)?;
     }
 
     // The first item is the default action when the full menu opens.
@@ -1943,6 +2275,18 @@ unsafe extern "system" fn window_proc(
     let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
     if state_ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    if message == WM_MEASUREITEM && lparam.0 != 0 {
+        let item = unsafe { &mut *(lparam.0 as *mut MEASUREITEMSTRUCT) };
+        if unsafe { measure_usage_header(item) } {
+            return LRESULT(1);
+        }
+    }
+    if message == WM_DRAWITEM && lparam.0 != 0 {
+        let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+        if unsafe { draw_usage_header(item) } {
+            return LRESULT(1);
+        }
     }
     let state = unsafe { &mut *state_ptr };
     let is_overlay = hwnd == state.overlay_hwnd;

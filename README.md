@@ -93,17 +93,24 @@ Example settings:
 hotkey = "Win+Alt+V"
 mode = "toggle" # or "push_to_talk"
 realtime = false
+scribe_credits_per_hour = 585 # estimated batch Scribe credits spent per hour
 keyterms = []
 insert_method = "type" # or "paste"
 ```
+
+The tray menu shows cached ElevenLabs usage with a color-coded progress bar and
+an estimate of remaining batch Scribe time. `scribe_credits_per_hour` controls
+that estimate; the default is 585 credits/hour. Realtime usage is intentionally
+excluded from the estimate. The value can be changed in
+`%APPDATA%\Scribetray\config.toml`.
 
 ## Versioning
 
 Release versions follow the implementation milestones: M0 was a disposable
 spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, recovery and send
-to `v0.4.x`, and subscription usage to `v0.5.x`. The current build is
-`v0.5.1`; patch numbers increase for fixes within the current milestone. The
-tray tooltip shows the running version.
+to `v0.4.x`, subscription usage to `v0.5.x`, and the usage header to `v0.6.x`.
+The current build is `v0.6.0`; patch numbers increase for fixes within the
+current milestone. The tray tooltip shows the running version.
 
 Scribetray is a per-user desktop application and needs no installer or
 administrator rights. The deployment script keeps versioned builds under the
@@ -126,8 +133,8 @@ WASAPI-backed capture through CPAL, batch and realtime Scribe transcription,
 push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
 clipboard-preserving paste, guarded Unicode typing, local history, retry,
 language selection, Enter-to-send while recording, optional Auto-Enter on stop,
-ElevenLabs usage in the tray menu, a final-minute recording countdown, and
-per-user autostart.
+ElevenLabs usage with a native progress header and batch time estimate in the
+tray menu, a final-minute recording countdown, and per-user autostart.
 
 Earlier Codex App logs reported the mouse-position fallback; updated runs have
 reported both UIA `TextPattern` caret detection and mouse fallback. The user

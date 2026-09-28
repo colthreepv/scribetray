@@ -17,6 +17,7 @@ mod wininput;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
+    hash::{Hash, Hasher},
     mem::size_of,
     sync::{
         OnceLock,
@@ -59,12 +60,13 @@ struct WorkerFinished {
 
 struct SubscriptionFinished {
     generation: u64,
-    result: Result<String, subscription::UsageError>,
+    result: Result<subscription::UsageSnapshot, subscription::UsageError>,
 }
 
 #[derive(Default)]
 struct SubscriptionCache {
     generation: u64,
+    api_key_fingerprint: Option<u64>,
     last_success: Option<Instant>,
     last_attempt: Option<Instant>,
     fetching: bool,
@@ -79,11 +81,18 @@ impl SubscriptionCache {
         finished_tx: &Sender<SubscriptionFinished>,
     ) {
         self.generation = self.generation.wrapping_add(1);
-        self.last_success = None;
         self.last_attempt = None;
         self.fetching = false;
         self.permission_denied = false;
-        let _ = ui.send(UiCommand::SetSubscriptionLine(None));
+        let fingerprint = config
+            .resolved_api_key()
+            .as_deref()
+            .map(api_key_fingerprint);
+        if fingerprint != self.api_key_fingerprint {
+            self.last_success = None;
+            let _ = ui.send(UiCommand::SetUsage(None));
+        }
+        self.api_key_fingerprint = fingerprint;
         self.refresh(config, finished_tx, true);
     }
 
@@ -116,7 +125,7 @@ impl SubscriptionCache {
         let generation = self.generation;
         let finished_tx = finished_tx.clone();
         thread::spawn(move || {
-            let result = subscription::fetch_usage_line(&api_key);
+            let result = subscription::fetch_usage(&api_key);
             let _ = finished_tx.send(SubscriptionFinished { generation, result });
         });
     }
@@ -127,13 +136,13 @@ impl SubscriptionCache {
         }
         self.fetching = false;
         match finished.result {
-            Ok(line) => {
+            Ok(usage) => {
                 self.last_success = Some(Instant::now());
-                let _ = ui.send(UiCommand::SetSubscriptionLine(Some(line)));
+                let _ = ui.send(UiCommand::SetUsage(Some(usage)));
             }
             Err(subscription::UsageError::PermissionDenied) => {
                 self.permission_denied = true;
-                let _ = ui.send(UiCommand::SetSubscriptionLine(None));
+                let _ = ui.send(UiCommand::SetUsage(None));
                 warn!("ElevenLabs usage line hidden: API key is missing the user_read permission");
             }
             Err(subscription::UsageError::HttpStatus(status)) => {
@@ -331,6 +340,12 @@ fn run() -> Result<(), String> {
     }
     info!("Scribetray stopped");
     Ok(())
+}
+
+fn api_key_fingerprint(api_key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    api_key.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1208,7 +1223,7 @@ fn make_ui_settings(
         max_seconds: config.max_seconds,
         realtime_enabled: config.realtime,
         api_key_configured: config.resolved_api_key().is_some(),
-        subscription_line: None,
+        scribe_credits_per_hour: config.scribe_credits_per_hour,
         selected_microphone: config.microphone.clone(),
         microphones,
         prefix_enabled: config.prefix_enabled,
@@ -1235,6 +1250,9 @@ fn validate_config(config: &Config) -> Result<(), String> {
     parse_hotkey(&config.hotkey)?;
     if config.max_seconds == 0 {
         return Err("max_seconds must be greater than zero".to_owned());
+    }
+    if config.scribe_credits_per_hour == 0 {
+        return Err("scribe_credits_per_hour must be greater than zero".to_owned());
     }
     if !config.mode.eq_ignore_ascii_case("toggle")
         && !config.mode.eq_ignore_ascii_case("push_to_talk")

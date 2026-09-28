@@ -49,6 +49,8 @@ pub struct Config {
     pub insert_method: String,
     pub restore_clipboard: bool,
     pub max_seconds: u32,
+    /// Estimated batch Scribe credits spent per hour of recording.
+    pub scribe_credits_per_hour: u32,
     /// Selected input device name, or `None` for the system default.
     pub microphone: Option<String>,
     pub sound_cues: bool,
@@ -72,6 +74,7 @@ impl fmt::Debug for Config {
             .field("insert_method", &self.insert_method)
             .field("restore_clipboard", &self.restore_clipboard)
             .field("max_seconds", &self.max_seconds)
+            .field("scribe_credits_per_hour", &self.scribe_credits_per_hour)
             .field("microphone", &self.microphone)
             .field("sound_cues", &self.sound_cues)
             .field("start_with_windows", &self.start_with_windows)
@@ -95,6 +98,7 @@ impl Default for Config {
             insert_method: "type".to_owned(),
             restore_clipboard: true,
             max_seconds: 600,
+            scribe_credits_per_hour: 585,
             microphone: None,
             sound_cues: true,
             start_with_windows: false,

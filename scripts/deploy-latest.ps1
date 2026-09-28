@@ -80,6 +80,7 @@ $stagingPath = Join-Path $BuildRoot ".staging-$([Guid]::NewGuid().ToString('N'))
 $latestPath = Join-Path $BuildRoot 'latest'
 $nextLinkPath = Join-Path $BuildRoot ".latest-next-$([Guid]::NewGuid().ToString('N'))"
 $oldLinkPath = Join-Path $BuildRoot ".latest-old-$([Guid]::NewGuid().ToString('N'))"
+$previousLatestBuildId = $null
 
 try {
     [void][IO.Directory]::CreateDirectory($stagingPath)
@@ -109,6 +110,7 @@ try {
             -not (Test-Path -LiteralPath (Join-Path $previousBuildPath 'build.json') -PathType Leaf)) {
             throw "Refusing to replace '$latestPath' because it does not point to a managed Scribetray build."
         }
+        $previousLatestBuildId = [string]$previousInfo.buildId
         [IO.Directory]::Move($latestPath, $oldLinkPath)
     }
 
@@ -136,6 +138,11 @@ try {
         ForEach-Object { try { $_.Path } catch { $null } } | Where-Object { $_ })
 }
 $runningPaths = @($runningPaths | ForEach-Object { [IO.Path]::GetFullPath($_) })
+if ($previousLatestBuildId -and
+    $runningPaths -contains [IO.Path]::GetFullPath((Join-Path $latestPath 'scribetray.exe'))) {
+    # Windows may report the stable junction path instead of its versioned target.
+    $runningPaths += [IO.Path]::GetFullPath((Join-Path (Join-Path $BuildRoot $previousLatestBuildId) 'scribetray.exe'))
+}
 $managedBuilds = @()
 foreach ($directory in Get-ChildItem -LiteralPath $BuildRoot -Directory -Force) {
     if ($directory.Name -notlike 'build-*' -or
