@@ -10,6 +10,7 @@ mod history;
 mod hotkey_dialog;
 mod realtime;
 mod scribe;
+mod subscription;
 mod windows_ui;
 mod wininput;
 
@@ -46,6 +47,7 @@ const TICK: Duration = Duration::from_millis(200);
 const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
 const CUE_SAMPLE_RATE: u32 = 22_050;
+const SUBSCRIPTION_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
 
@@ -53,6 +55,101 @@ static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
 struct WorkerFinished {
     history_id: String,
     result: Result<Transcription, String>,
+}
+
+struct SubscriptionFinished {
+    generation: u64,
+    result: Result<String, subscription::UsageError>,
+}
+
+#[derive(Default)]
+struct SubscriptionCache {
+    generation: u64,
+    last_success: Option<Instant>,
+    last_attempt: Option<Instant>,
+    fetching: bool,
+    permission_denied: bool,
+}
+
+impl SubscriptionCache {
+    fn reset_for_config(
+        &mut self,
+        config: &Config,
+        ui: &UiRuntime,
+        finished_tx: &Sender<SubscriptionFinished>,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        self.last_success = None;
+        self.last_attempt = None;
+        self.fetching = false;
+        self.permission_denied = false;
+        let _ = ui.send(UiCommand::SetSubscriptionLine(None));
+        self.refresh(config, finished_tx, true);
+    }
+
+    fn refresh(
+        &mut self,
+        config: &Config,
+        finished_tx: &Sender<SubscriptionFinished>,
+        force: bool,
+    ) {
+        if self.fetching || self.permission_denied {
+            return;
+        }
+        let Some(api_key) = config.resolved_api_key() else {
+            return;
+        };
+        if !force {
+            let stale = self
+                .last_success
+                .is_none_or(|last_success| last_success.elapsed() >= SUBSCRIPTION_REFRESH_INTERVAL);
+            let recently_attempted = self
+                .last_attempt
+                .is_some_and(|last_attempt| last_attempt.elapsed() < SUBSCRIPTION_REFRESH_INTERVAL);
+            if !stale || recently_attempted {
+                return;
+            }
+        }
+
+        self.fetching = true;
+        self.last_attempt = Some(Instant::now());
+        let generation = self.generation;
+        let finished_tx = finished_tx.clone();
+        thread::spawn(move || {
+            let result = subscription::fetch_usage_line(&api_key);
+            let _ = finished_tx.send(SubscriptionFinished { generation, result });
+        });
+    }
+
+    fn apply_finished(&mut self, finished: SubscriptionFinished, ui: &UiRuntime) {
+        if finished.generation != self.generation {
+            return;
+        }
+        self.fetching = false;
+        match finished.result {
+            Ok(line) => {
+                self.last_success = Some(Instant::now());
+                let _ = ui.send(UiCommand::SetSubscriptionLine(Some(line)));
+            }
+            Err(subscription::UsageError::PermissionDenied) => {
+                self.permission_denied = true;
+                let _ = ui.send(UiCommand::SetSubscriptionLine(None));
+                warn!("ElevenLabs usage line hidden: API key is missing the user_read permission");
+            }
+            Err(subscription::UsageError::HttpStatus(status)) => {
+                warn!("could not refresh ElevenLabs usage: HTTP {status}");
+            }
+            Err(subscription::UsageError::RequestFailed) => {
+                warn!("could not refresh ElevenLabs usage: request failed");
+            }
+            Err(subscription::UsageError::InvalidResponse) => {
+                warn!("could not refresh ElevenLabs usage: invalid subscription response");
+            }
+            Err(subscription::UsageError::ClientInitialization) => {
+                warn!("could not initialize the ElevenLabs usage HTTP client");
+            }
+        }
+    }
 }
 
 enum Delivery {
@@ -146,6 +243,9 @@ fn run() -> Result<(), String> {
         make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
     let ui = UiRuntime::start(ui_settings.clone())?;
     let (worker_tx, worker_rx) = mpsc::channel();
+    let (subscription_tx, subscription_rx) = mpsc::channel();
+    let mut subscription_cache = SubscriptionCache::default();
+    subscription_cache.reset_for_config(&config, &ui, &subscription_tx);
 
     let mut active: Option<ActiveRecording> = None;
     let mut deliveries: HashMap<String, Delivery> = HashMap::new();
@@ -155,6 +255,9 @@ fn run() -> Result<(), String> {
     info!("Scribetray started");
     loop {
         match ui.events.recv_timeout(TICK) {
+            Ok(UiEvent::UsageRefreshRequested) => {
+                subscription_cache.refresh(&config, &subscription_tx, false);
+            }
             Ok(event) => {
                 if !handle_ui_event(
                     event,
@@ -173,6 +276,10 @@ fn run() -> Result<(), String> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        while let Ok(finished) = subscription_rx.try_recv() {
+            subscription_cache.apply_finished(finished, &ui);
         }
 
         if active
@@ -206,6 +313,7 @@ fn run() -> Result<(), String> {
             && let Some(updated) = config_monitor.load_if_changed(&config)
         {
             config = updated;
+            subscription_cache.reset_for_config(&config, &ui, &subscription_tx);
             let microphones = ui_settings.microphones.clone();
             ui_settings =
                 make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
@@ -239,6 +347,7 @@ fn handle_ui_event(
     done_until: &mut Option<Instant>,
 ) -> bool {
     match event {
+        UiEvent::UsageRefreshRequested => return true,
         UiEvent::ToggleRecord => {
             if active.is_some() {
                 stop_recording(
@@ -1099,6 +1208,7 @@ fn make_ui_settings(
         max_seconds: config.max_seconds,
         realtime_enabled: config.realtime,
         api_key_configured: config.resolved_api_key().is_some(),
+        subscription_line: None,
         selected_microphone: config.microphone.clone(),
         microphones,
         prefix_enabled: config.prefix_enabled,

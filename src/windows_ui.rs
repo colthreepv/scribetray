@@ -26,10 +26,13 @@ use windows::{
             COLORREF, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
         },
         Graphics::Gdi::{
-            AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-            CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-            GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
-            ReleaseDC, SelectObject,
+            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+            BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+            DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_DONTCARE,
+            FW_SEMIBOLD, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, GetTextFaceW,
+            GetTextMetricsW, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+            MonitorFromRect, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+            TEXTMETRICW, TRANSPARENT, TextOutW,
         },
         System::LibraryLoader::GetModuleHandleW,
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -297,6 +300,8 @@ pub struct UiSettings {
     pub realtime_enabled: bool,
     /// Whether an ElevenLabs API key is resolved from the environment or config.
     pub api_key_configured: bool,
+    /// Cached ElevenLabs usage text shown at the top of the tray menu.
+    pub subscription_line: Option<String>,
     pub selected_microphone: Option<String>,
     pub microphones: Vec<String>,
     pub prefix_enabled: bool,
@@ -317,6 +322,7 @@ impl Default for UiSettings {
             max_seconds: 600,
             realtime_enabled: false,
             api_key_configured: false,
+            subscription_line: None,
             selected_microphone: None,
             microphones: Vec::new(),
             prefix_enabled: true,
@@ -374,6 +380,7 @@ pub enum HotkeyPurpose {
 /// Actions initiated by the user through the tray or registered hotkeys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
+    UsageRefreshRequested,
     ToggleRecord,
     EnterPressed,
     RecoverLast,
@@ -411,6 +418,7 @@ pub enum UiEvent {
 #[derive(Clone, Debug)]
 pub enum UiCommand {
     SetSettings(UiSettings),
+    SetSubscriptionLine(Option<String>),
     UpdateHistory(Vec<HistoryMenuItem>),
     SetRecording(bool),
     /// Live input level for the overlay waveform; `None` when not capturing.
@@ -873,6 +881,7 @@ impl UiState {
                 }
                 self.refresh_tray();
             }
+            UiCommand::SetSubscriptionLine(line) => self.settings.subscription_line = line,
             UiCommand::UpdateHistory(history) => self.settings.history = history,
             UiCommand::SetRecording(recording) => {
                 self.set_recording(recording);
@@ -1168,6 +1177,7 @@ impl UiState {
     fn show_menu(&mut self) {
         self.clear_tray_error();
         self.refresh_tray();
+        self.handle_user_event(UiEvent::UsageRefreshRequested);
         let (menu, actions) = match build_tray_menu(&self.settings, self.recording) {
             Ok(menu) => menu,
             Err(error) => {
@@ -1565,6 +1575,10 @@ fn build_tray_menu(
     let mut next_dynamic_id = 100_u32;
     let setup_ready = settings.api_key_configured;
     let toggle_label = settings.toggle_hotkey.combo_label();
+
+    if let Some(line) = settings.subscription_line.as_deref() {
+        append_flags(root.0, MF_STRING | MF_GRAYED, 0, line)?;
+    }
 
     // The first item is the default action when the full menu opens.
     let default_id;
@@ -2181,63 +2195,199 @@ fn draw_countdown(
     alpha: f32,
 ) {
     let text = format!("{}:{:02}", remaining / 60, remaining % 60);
-    let text_width: f32 = text
-        .chars()
-        .map(|character| if character == ':' { 4.5 } else { 7.0 })
-        .sum::<f32>()
-        * scale;
-    let mut x = pad + pill_width - 6.0 * scale - text_width;
-    let y = center_y - 4.0 * scale;
-    let color = work_color(alpha);
-    let stroke = 1.2 * scale;
-    const DIGIT_SEGMENTS: [u8; 10] = [
-        0b011_1111, // 0
-        0b000_0110, // 1
-        0b101_1011, // 2
-        0b100_1111, // 3
-        0b110_0110, // 4
-        0b110_1101, // 5
-        0b111_1101, // 6
-        0b000_0111, // 7
-        0b111_1111, // 8
-        0b110_1111, // 9
-    ];
-    const SEGMENTS: [(f32, f32, f32, f32); 7] = [
-        (1.0, 0.0, 4.0, 0.0),
-        (4.5, 0.5, 4.5, 3.5),
-        (4.5, 4.5, 4.5, 7.5),
-        (1.0, 8.0, 4.0, 8.0),
-        (0.5, 4.5, 0.5, 7.5),
-        (0.5, 0.5, 0.5, 3.5),
-        (1.0, 4.0, 4.0, 4.0),
-    ];
+    let width = match i32::try_from(pixmap.width()) {
+        Ok(width) => width,
+        Err(_) => return,
+    };
+    let height = match i32::try_from(pixmap.height()) {
+        Ok(height) => height,
+        Err(_) => return,
+    };
+    let Some(mask_len) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return;
+    };
 
-    for character in text.chars() {
-        if character == ':' {
-            for offset in [2.5, 5.5] {
-                if let Some(path) = circle_path(x + scale, y + offset * scale, 0.65 * scale) {
-                    fill_path(pixmap, &path, color);
-                }
+    let dc = unsafe { CreateCompatibleDC(None) };
+    if dc.0.is_null() {
+        return;
+    }
+
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let mut mask_pixels: *mut core::ffi::c_void = core::ptr::null_mut();
+    let bitmap = match unsafe {
+        CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut mask_pixels, None, 0)
+    } {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            unsafe {
+                let _ = DeleteDC(dc);
             }
-            x += 4.5 * scale;
+            return;
+        }
+    };
+    if mask_pixels.is_null() {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+        }
+        return;
+    }
+    unsafe { std::slice::from_raw_parts_mut(mask_pixels.cast::<u8>(), mask_len).fill(0) };
+
+    let previous_bitmap = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
+    if previous_bitmap.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+        }
+        return;
+    }
+
+    let font_height = (11.0 * scale).round().max(1.0) as i32;
+    let Some((font, previous_font)) = select_overlay_countdown_font(dc, font_height) else {
+        unsafe {
+            let _ = SelectObject(dc, previous_bitmap);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+        }
+        return;
+    };
+
+    let text_wide = wide(&text);
+    let mut extent = SIZE::default();
+    let mut metrics = TEXTMETRICW::default();
+    let measured = unsafe {
+        GetTextExtentPoint32W(
+            dc,
+            &text_wide[..text_wide.len().saturating_sub(1)],
+            &mut extent,
+        )
+        .as_bool()
+            && GetTextMetricsW(dc, &mut metrics).as_bool()
+    };
+    if measured {
+        let right = pad + pill_width - 10.0 * scale;
+        let x = (right - extent.cx as f32).round() as i32;
+        let y = (center_y - metrics.tmHeight as f32 / 2.0).round() as i32;
+        unsafe {
+            let _ = SetBkMode(dc, TRANSPARENT);
+            let _ = SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        }
+        if unsafe { TextOutW(dc, x, y, &text_wide[..text_wide.len().saturating_sub(1)]) }.as_bool()
+        {
+            composite_countdown_mask(pixmap, mask_pixels, alpha);
+        }
+    }
+
+    unsafe {
+        let _ = SelectObject(dc, previous_font);
+        let _ = DeleteObject(HGDIOBJ(font.0));
+        let _ = SelectObject(dc, previous_bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(dc);
+    }
+}
+
+/// Selects Segoe UI Variable Semibold when installed, falling back to Segoe UI.
+fn select_overlay_countdown_font(dc: HDC, height: i32) -> Option<(HFONT, HGDIOBJ)> {
+    for family in ["Segoe UI Variable", "Segoe UI"] {
+        let family_wide = wide(family);
+        let font = unsafe {
+            CreateFontW(
+                -height,
+                0,
+                0,
+                0,
+                FW_SEMIBOLD.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                ANTIALIASED_QUALITY,
+                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                PCWSTR(family_wide.as_ptr()),
+            )
+        };
+        if font.0.is_null() {
             continue;
         }
 
-        let mask = DIGIT_SEGMENTS[character.to_digit(10).unwrap_or(0) as usize];
-        for (index, (x1, y1, x2, y2)) in SEGMENTS.iter().enumerate() {
-            if mask & (1 << index) == 0 {
-                continue;
+        let previous = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
+        if previous.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(font.0));
             }
-            if let Some(path) = line_path(
-                x + x1 * scale,
-                y + y1 * scale,
-                x + x2 * scale,
-                y + y2 * scale,
-            ) {
-                stroke_path(pixmap, &path, color, stroke);
-            }
+            continue;
         }
-        x += 7.0 * scale;
+
+        let mut actual_face = [0_u16; 64];
+        let face_length = unsafe { GetTextFaceW(dc, Some(&mut actual_face)) };
+        let face_length = actual_face
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(face_length.max(0) as usize)
+            .min(actual_face.len());
+        let actual_face = String::from_utf16_lossy(&actual_face[..face_length]);
+        let matches_requested_family = if family == "Segoe UI Variable" {
+            actual_face.starts_with("Segoe UI Variable")
+                || actual_face.eq_ignore_ascii_case("Segoe UI")
+        } else {
+            actual_face.eq_ignore_ascii_case("Segoe UI")
+        };
+        if matches_requested_family {
+            return Some((font, previous));
+        }
+
+        unsafe {
+            let _ = SelectObject(dc, previous);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+    None
+}
+
+/// Blends the grayscale GDI glyph mask into tiny-skia's premultiplied RGBA data.
+fn composite_countdown_mask(
+    pixmap: &mut Pixmap,
+    mask_pixels: *const core::ffi::c_void,
+    alpha: f32,
+) {
+    let mask = unsafe { std::slice::from_raw_parts(mask_pixels.cast::<u8>(), pixmap.data().len()) };
+    let pixmap_data = pixmap.data_mut();
+    for (mask_pixel, target_pixel) in mask.chunks_exact(4).zip(pixmap_data.chunks_exact_mut(4)) {
+        let coverage =
+            (u16::from(mask_pixel[0]) + u16::from(mask_pixel[1]) + u16::from(mask_pixel[2])) as f32
+                / (3.0 * 255.0);
+        let source_alpha = (coverage * alpha).clamp(0.0, 1.0);
+        if source_alpha <= 0.0 {
+            continue;
+        }
+        let inverse_alpha = 1.0 - source_alpha;
+        target_pixel[0] = (WORK_RGB.0 as f32 * source_alpha
+            + target_pixel[0] as f32 * inverse_alpha)
+            .round() as u8;
+        target_pixel[1] = (WORK_RGB.1 as f32 * source_alpha
+            + target_pixel[1] as f32 * inverse_alpha)
+            .round() as u8;
+        target_pixel[2] = (WORK_RGB.2 as f32 * source_alpha
+            + target_pixel[2] as f32 * inverse_alpha)
+            .round() as u8;
+        target_pixel[3] =
+            (255.0 * source_alpha + target_pixel[3] as f32 * inverse_alpha).round() as u8;
     }
 }
 

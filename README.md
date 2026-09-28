@@ -26,6 +26,9 @@ under `%LOCALAPPDATA%\Scribetray`.
   configured toggle chord records until you release it.
 - Left-clicking the system-tray icon copies the newest recoverable dictation;
   right-click opens the full menu.
+- The right-click menu shows ElevenLabs credit usage when the API key has
+  `user_read` permission. It refreshes at startup and when the menu opens with
+  a cache older than 10 minutes.
 - The tray menu can capture a new toggle hotkey and controls push-to-talk,
   realtime transcription, microphone selection, the emoji prefix, Auto-Enter,
   sound cues, typing mode, language, Start with Windows, and recording history.
@@ -70,10 +73,10 @@ insert_method = "type" # or "paste"
 ## Versioning
 
 Release versions follow the implementation milestones: M0 was a disposable
-spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, and the recovery
-and send refresh is `v0.4.x`. The current build is `v0.4.0`; patch numbers
-increase for fixes within the current milestone. The tray tooltip shows the
-running version.
+spike, M1 maps to `v0.1.x`, M2 to `v0.2.x`, M3 to `v0.3.x`, recovery and send
+to `v0.4.x`, and subscription usage to `v0.5.x`. The current build is
+`v0.5.0`; patch numbers increase for fixes within the current milestone. The
+tray tooltip shows the running version.
 
 Scribetray is a per-user desktop application and needs no installer or
 administrator rights. It can run directly from this repository's
@@ -95,7 +98,8 @@ WASAPI-backed capture through CPAL, batch and realtime Scribe transcription,
 push-to-talk, a configurable toggle hotkey, a non-activating recording anchor,
 clipboard-preserving paste, guarded Unicode typing, local history, retry,
 language selection, Enter-to-send while recording, optional Auto-Enter on stop,
-and per-user autostart.
+ElevenLabs usage in the tray menu, a final-minute recording countdown, and
+per-user autostart.
 
 Earlier Codex App logs reported the mouse-position fallback; updated runs have
 reported both UIA `TextPattern` caret detection and mouse fallback. The user
