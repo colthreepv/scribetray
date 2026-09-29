@@ -104,7 +104,9 @@ impl StreamErrors {
     fn report(&self, error: &cpal::Error) {
         if matches!(
             error.kind(),
-            cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
+            cpal::ErrorKind::Xrun
+                | cpal::ErrorKind::DeviceChanged
+                | cpal::ErrorKind::RealtimeDenied
         ) {
             self.glitches.fetch_add(1, Ordering::Relaxed);
             return;

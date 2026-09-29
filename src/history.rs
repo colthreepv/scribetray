@@ -80,23 +80,6 @@ impl History {
         Ok(history)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Persists samples as signed 16-bit little-endian PCM and records a
-    /// pending item. The caller must provide mono samples at 16 kHz.
-    /// Audio is on disk before this method returns, so it can be uploaded after
-    /// calling this method and retried later if the upload fails.
-    pub fn create_pending(&self, samples: &[i16]) -> Result<Recording, HistoryError> {
-        let mut pcm_s16le = Vec::with_capacity(samples.len() * BYTES_PER_SAMPLE);
-        for sample in samples {
-            pcm_s16le.extend_from_slice(&sample.to_le_bytes());
-        }
-        let duration_seconds = samples.len().div_ceil(SAMPLE_RATE_HZ as usize);
-        self.create_pending_pcm(&pcm_s16le, duration_seconds.min(u32::MAX as usize) as u32)
-    }
-
     /// Persists already-encoded 16 kHz mono signed-16 little-endian PCM and
     /// records a pending item. Duration milliseconds are calculated from the
     /// byte count; `duration_seconds` preserves the audio layer's rounded
@@ -184,15 +167,6 @@ impl History {
             return Err(HistoryError::InvalidAudio);
         }
         Ok(bytes)
-    }
-
-    /// Returns pending or failed records that can be submitted again.
-    pub fn retryable(&self) -> Result<Vec<Recording>, HistoryError> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .filter(|recording| recording.status != RecordingStatus::Succeeded)
-            .collect())
     }
 
     pub fn mark_succeeded(

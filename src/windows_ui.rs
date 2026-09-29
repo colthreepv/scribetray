@@ -192,17 +192,6 @@ impl Default for HotkeyModifiers {
 }
 
 impl HotkeyModifiers {
-    /// Creates a Win+Alt hotkey with optional Shift and Ctrl modifiers.
-    /// The arguments are ordered as Shift, then Ctrl.
-    pub const fn new(shift: bool, control: bool) -> Self {
-        Self {
-            win: true,
-            alt: true,
-            control,
-            shift,
-        }
-    }
-
     /// Creates a hotkey with explicit Win, Alt, Shift, and Ctrl modifiers.
     pub const fn with_all_modifiers(win: bool, alt: bool, shift: bool, control: bool) -> Self {
         Self {
@@ -364,15 +353,6 @@ pub struct CaretRect {
 }
 
 impl CaretRect {
-    pub fn from_edges(left: i32, top: i32, right: i32, bottom: i32) -> Self {
-        Self {
-            left,
-            top,
-            width: right.saturating_sub(left),
-            height: bottom.saturating_sub(top),
-        }
-    }
-
     fn is_valid(self) -> bool {
         self.width >= 0 && self.height >= 0
     }

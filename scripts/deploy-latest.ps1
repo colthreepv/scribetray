@@ -3,7 +3,8 @@ param(
     [string]$BuildRoot,
     [int]$KeepBuilds = 0,
     [string]$Target,
-    [string[]]$CargoArgs = @()
+    [string[]]$CargoArgs = @(),
+    [string]$CandidateLabel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,12 +50,42 @@ $cargoMetadata = ($metadataOutput -join [Environment]::NewLine) | ConvertFrom-Js
 $package = $cargoMetadata.packages | Where-Object { $_.name -eq 'scribetray' } | Select-Object -First 1
 if (-not $package) { throw 'Cargo metadata did not contain the scribetray package.' }
 
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0 -or -not $sourceCommit) { throw 'Could not identify the source commit.' }
+$sourceCommit = ([string]$sourceCommit).Trim()
+$sourceStatus = ((& git -C $repoRoot status --porcelain --untracked-files=all 2>$null) -join [Environment]::NewLine).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the source working tree.' }
+$sourceTreeClean = [string]::IsNullOrWhiteSpace($sourceStatus)
+if ($CandidateLabel) {
+    $candidatePattern = '^' + [regex]::Escape([string]$package.version) + '-test\.[1-9][0-9]*$'
+    if ($CandidateLabel -notmatch $candidatePattern) {
+        throw "CandidateLabel must match '$($package.version)-test.N', with N starting at 1."
+    }
+    if (-not $sourceTreeClean) {
+        throw 'A named test candidate requires a clean, committed working tree.'
+    }
+    $candidatePath = Join-Path $repoRoot "dist\candidates\$CandidateLabel"
+    if (Test-Path -LiteralPath $candidatePath) {
+        throw "Candidate '$CandidateLabel' already exists. Increment the test number instead of replacing it."
+    }
+}
+
 $buildArgs = @('build', '--release', '--locked', '--manifest-path', $manifest)
 if ($Target) { $buildArgs += @('--target', $Target) }
 $buildArgs += $CargoArgs
 Write-Host "Building Scribetray $($package.version)..."
 & cargo @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE." }
+
+$builtCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0 -or ([string]$builtCommit).Trim() -ne $sourceCommit) {
+    throw 'The source commit changed while Cargo was building; refusing to deploy this artifact.'
+}
+$postBuildStatus = ((& git -C $repoRoot status --porcelain --untracked-files=all 2>$null) -join [Environment]::NewLine).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Could not recheck the source working tree after building.' }
+if ($CandidateLabel -and -not [string]::IsNullOrWhiteSpace($postBuildStatus)) {
+    throw 'The source working tree changed while Cargo was building; refusing to deploy this candidate.'
+}
 
 $targetDirectory = [string]$cargoMetadata.target_directory
 for ($i = 0; $i -lt $CargoArgs.Count; $i++) {
@@ -74,9 +105,13 @@ $artifact = Join-Path $artifactDirectory 'scribetray.exe'
 if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) { throw "Cargo succeeded, but the executable was not found at '$artifact'." }
 
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')
-$buildId = "build-$($package.version)-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$buildLabel = if ($CandidateLabel) { $CandidateLabel } else { [string]$package.version }
+$buildId = "build-$buildLabel-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $buildPath = Join-Path $BuildRoot $buildId
 $stagingPath = Join-Path $BuildRoot ".staging-$([Guid]::NewGuid().ToString('N'))"
+$candidateStagingPath = if ($CandidateLabel) {
+    Join-Path (Join-Path $repoRoot 'dist\candidates') ".staging-$([Guid]::NewGuid().ToString('N'))"
+} else { $null }
 $latestPath = Join-Path $BuildRoot 'latest'
 $nextLinkPath = Join-Path $BuildRoot ".latest-next-$([Guid]::NewGuid().ToString('N'))"
 $oldLinkPath = Join-Path $BuildRoot ".latest-old-$([Guid]::NewGuid().ToString('N'))"
@@ -85,17 +120,40 @@ $previousLatestBuildId = $null
 try {
     [void][IO.Directory]::CreateDirectory($stagingPath)
     Copy-Item -LiteralPath $artifact -Destination (Join-Path $stagingPath 'scribetray.exe')
+    $artifactHash = (Get-FileHash -LiteralPath (Join-Path $stagingPath 'scribetray.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $cargoVersion = (& cargo --version | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not record the Cargo version.' }
+    $rustcVersion = (& rustc --version --verbose | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Could not record the Rust compiler version.' }
+    $hostTarget = (& rustc --version --verbose | Where-Object { $_ -match '^host: ' } | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not determine the Rust host target.' }
+    $resolvedTarget = if ($Target) { $Target } elseif ($hostTarget) { ([string]$hostTarget -replace '^host: ', '').Trim() } else { 'host-default' }
     $buildInfo = [ordered]@{
         application = 'Scribetray'
         buildId = $buildId
         version = [string]$package.version
+        candidateLabel = if ($CandidateLabel) { $CandidateLabel } else { $null }
         builtAtUtc = [DateTime]::UtcNow.ToString('o')
+        sourceCommit = $sourceCommit
+        sourceTreeClean = $sourceTreeClean
+        target = $resolvedTarget
+        cargoVersion = ([string]$cargoVersion).Trim()
+        rustcVersion = $rustcVersion
+        cargoArgs = @($CargoArgs)
+        executableSha256 = $artifactHash
     }
-    $sourceCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -eq 0 -and $sourceCommit) { $buildInfo.sourceCommit = [string]$sourceCommit }
     $json = $buildInfo | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $stagingPath 'build.json'), $json, [Text.UTF8Encoding]::new($false))
     [IO.Directory]::Move($stagingPath, $buildPath)
+
+    if ($CandidateLabel) {
+        $candidateRoot = Join-Path $repoRoot 'dist\candidates'
+        [void][IO.Directory]::CreateDirectory($candidateRoot)
+        [void][IO.Directory]::CreateDirectory($candidateStagingPath)
+        Copy-Item -LiteralPath (Join-Path $buildPath 'scribetray.exe') -Destination (Join-Path $candidateStagingPath 'scribetray.exe')
+        Copy-Item -LiteralPath (Join-Path $buildPath 'build.json') -Destination (Join-Path $candidateStagingPath 'build.json')
+        [IO.Directory]::Move($candidateStagingPath, $candidatePath)
+    }
 
     [void](New-Item -ItemType Junction -Path $nextLinkPath -Target $buildPath)
     $hadPrevious = Test-Path -LiteralPath $latestPath
@@ -125,6 +183,9 @@ try {
     if (Test-Path -LiteralPath $oldLinkPath) { [IO.Directory]::Delete($oldLinkPath) }
 } finally {
     if (Test-Path -LiteralPath $stagingPath) { Remove-Item -LiteralPath $stagingPath -Recurse -Force }
+    if ($candidateStagingPath -and (Test-Path -LiteralPath $candidateStagingPath)) {
+        Remove-Item -LiteralPath $candidateStagingPath -Recurse -Force
+    }
     if (Test-Path -LiteralPath $nextLinkPath) { [IO.Directory]::Delete($nextLinkPath) }
 }
 
@@ -172,4 +233,10 @@ foreach ($build in $orderedBuilds) {
     }
 }
 
-Write-Host "Scribetray $($package.version) is now available at '$latestPath\scribetray.exe'."
+if ($CandidateLabel) {
+    Write-Host "Candidate $CandidateLabel is deployed at '$latestPath\scribetray.exe'."
+    Write-Host "Candidate record and executable: '$candidatePath'."
+    Write-Host 'Close any already-running Scribetray instance, then start the latest executable to test this candidate.'
+} else {
+    Write-Host "Scribetray $($package.version) is now available at '$latestPath\scribetray.exe'."
+}

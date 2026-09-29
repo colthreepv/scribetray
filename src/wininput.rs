@@ -171,17 +171,6 @@ fn same_input_target(expected: &TargetSnapshot, current: &TargetSnapshot) -> boo
     }
 }
 
-/// Return whether the saved target is still the active foreground/focus target.
-///
-/// If a RuntimeId was captured, failure to query the current RuntimeId is treated
-/// as a failed guard. HWND comparison is used when the snapshot had no RuntimeId.
-pub fn target_is_current(target: &TargetSnapshot) -> bool {
-    let Ok(_com) = ComApartment::initialize() else {
-        return false;
-    };
-    target_is_current_inner(target)
-}
-
 /// Insert text only if the captured focus is still current.
 ///
 /// For paste mode, the prior clipboard data object is restored after a short

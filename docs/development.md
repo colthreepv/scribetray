@@ -50,6 +50,63 @@ default retention count is three. The helper runs
 <code>cargo build --release --locked</code> and promotes the output only after
 the executable has been staged.
 
+## Manual single-user release flow
+
+Releases are prepared and tested locally by one user. Commit the complete
+release source locally first, and build each candidate from a commit. Keep
+Cargo and the executable at the intended stable release version (for example,
+<code>0.6.3</code>). A test label such as <code>0.6.3-test.1</code> is a
+candidate suffix, not a Cargo version or executable version.
+
+Pass the candidate suffix to the deploy helper, for example:
+
+```powershell
+.\scripts\deploy-latest.ps1 -CandidateLabel '0.6.3-test.1'
+```
+
+The helper keeps the stable Cargo/executable version in the build and records
+the suffix as <code>candidateLabel</code> in <code>build.json</code>. It copies
+the candidate executable and metadata to
+<code>dist\candidates\0.6.3-test.1\</code>, where test builds sharing the
+same stable version remain distinguishable. Keep the selected candidate
+available until it is rejected or packaged.
+
+Close the old Scribetray instance completely, including its tray process, then
+launch <code>dist\candidates\0.6.3-test.1\scribetray.exe</code>. Confirm its
+<code>build.json</code> identifies the intended candidate and source commit,
+then test it. If changes are needed, commit them locally and build a new
+candidate with the next suffix. Do not push commits or create or push tags
+before the user approves the tested candidate.
+
+After approval, create an annotated stable tag (for example,
+<code>v0.6.3</code>) on the approved source commit and push that commit and tag
+to the configured Gitea repository. Verify that the one-way mirror makes the
+same commit and tag available on GitHub. Gitea publishes source commits and
+tags; the GitHub release publishes downloadable assets.
+
+```powershell
+git tag -a v0.6.3 -m "Scribetray v0.6.3"
+git push origin main refs/tags/v0.6.3
+```
+
+After the mirror has the tag, prepare the package using the exact approved
+candidate and an agent-written summary of the commits since the previous stable
+tag. Review the generated notes and assets, then publish them:
+
+```powershell
+.\scripts\release.ps1 -CandidateLabel '0.6.3-test.1' -Summary 'One to three concise sentences describing the user-visible changes.'
+.\scripts\release.ps1 -CandidateLabel '0.6.3-test.1' -Action Publish
+```
+
+The script checks that the candidate checksum matches, the stable tag points
+to the candidate commit on local Git, Gitea, and GitHub, and Cargo still has the
+stable version. It packages the exact candidate executable into
+<code>scribetray-v0.6.3-x86_64.zip</code> and writes
+<code>SHA256SUMS.txt</code>. It never creates or pushes tags. Use the
+[release notes template](release-notes-template.md), which has only the
+<code>{{VERSION}}</code> and <code>{{SUMMARY}}</code> placeholders. This flow
+does not use CI to build or publish releases.
+
 ## Realtime transcription and fallback
 
 Batch mode records audio locally and submits it to Scribe after recording

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.3
+
+Removes unused internal helpers; no user-visible behavior changes.
+
 ## v0.6.2
 
 Preserves recordings through recoverable audio-capture glitches, logs user
