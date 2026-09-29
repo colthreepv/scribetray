@@ -66,7 +66,7 @@ Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
 | Key | While idle | While recording |
 |---|---|---|
 | **Win+Alt+V** | Start recording | Stop and insert |
-| **Enter** | (untouched) | Stop, insert, and send |
+| **Enter** | (untouched) | Stop, insert, and send, when Enter interception is enabled |
 | **Esc** | (untouched) | Cancel |
 
 **The tray icon** shows what's happening: a coral wave when ready, blue while recording, amber while transcribing, and a red × if something failed.
@@ -78,9 +78,13 @@ Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
 - **Left-click** the icon to copy your last dictation, or to retry it if it failed.
 - **Right-click** for the menu. From there you can choose the microphone and language, browse recent dictations, switch to push-to-talk, and change the hotkey. It also shows your ElevenLabs usage for the month.
 
+The tray menu includes **Intercept Enter while recording**. Turn it off to type
+normally while dictating; Enter will reach the focused app and the recording
+will continue. Use the recording hotkey to stop and insert the transcript.
+
 The tray menu also shows cached monthly usage and an estimate of remaining batch transcription time. Set `scribe_credits_per_hour` to tune that estimate; realtime usage is excluded.
 
-Scribetray listens only while recording. In realtime mode, audio streams to ElevenLabs as you speak; in batch mode, it is uploaded when you stop. Enter and Esc are claimed *only* while a recording is running.
+Scribetray listens only while recording. In realtime mode, audio streams to ElevenLabs as you speak; in batch mode, it is uploaded when you stop. Esc is claimed only while a recording is running. Enter is intercepted during recording only when **Intercept Enter while recording** is enabled.
 
 ## What does it cost?
 
@@ -106,6 +110,7 @@ language = "auto"          # or a language code such as "ita" or "eng"
 prefix = "🎙️ "
 prefix_enabled = true
 auto_enter = false         # also press Enter after every dictation
+intercept_enter = true     # Enter stops recording and sends the dictation
 insert_method = "type"     # or "paste"
 restore_clipboard = true
 max_seconds = 600          # a recording stops by itself after 10 minutes

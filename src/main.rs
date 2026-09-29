@@ -481,6 +481,10 @@ fn handle_ui_event(
             config.auto_enter = !config.auto_enter;
             save_config(config, ui);
         }
+        UiEvent::ToggleEnterInterception => {
+            config.intercept_enter = !config.intercept_enter;
+            save_config(config, ui);
+        }
         UiEvent::ToggleSound => {
             config.sound_cues = !config.sound_cues;
             save_config(config, ui);
@@ -1235,6 +1239,7 @@ fn make_ui_settings(
         microphones,
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
+        intercept_enter: config.intercept_enter,
         sound_enabled: config.sound_cues,
         type_mode: config.insert_method.eq_ignore_ascii_case("type"),
         autostart_enabled: config.start_with_windows,

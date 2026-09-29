@@ -42,6 +42,8 @@ prefix = "🎙️ "
 prefix_enabled = true
 # Submit the text after insertion for every recording.
 auto_enter = false
+# Intercept Enter while recording to stop and send the transcription.
+intercept_enter = true
 # Insert transcripts by simulated typing or clipboard paste.
 insert_method = "type"
 restore_clipboard = true
@@ -80,6 +82,8 @@ pub struct Config {
     pub prefix: String,
     pub prefix_enabled: bool,
     pub auto_enter: bool,
+    /// Intercept Enter during recording to stop and send the transcription.
+    pub intercept_enter: bool,
     /// Transcript insertion strategy (for example, `paste` or `type`).
     pub insert_method: String,
     pub restore_clipboard: bool,
@@ -106,6 +110,7 @@ impl fmt::Debug for Config {
             .field("prefix", &self.prefix)
             .field("prefix_enabled", &self.prefix_enabled)
             .field("auto_enter", &self.auto_enter)
+            .field("intercept_enter", &self.intercept_enter)
             .field("insert_method", &self.insert_method)
             .field("restore_clipboard", &self.restore_clipboard)
             .field("max_seconds", &self.max_seconds)
@@ -130,6 +135,7 @@ impl Default for Config {
             prefix: "🎙️ ".to_owned(),
             prefix_enabled: true,
             auto_enter: false,
+            intercept_enter: true,
             insert_method: "type".to_owned(),
             restore_clipboard: true,
             max_seconds: 600,

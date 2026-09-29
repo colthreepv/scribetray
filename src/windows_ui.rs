@@ -309,6 +309,7 @@ pub struct UiSettings {
     pub microphones: Vec<String>,
     pub prefix_enabled: bool,
     pub auto_enter: bool,
+    pub intercept_enter: bool,
     pub sound_enabled: bool,
     pub type_mode: bool,
     pub autostart_enabled: bool,
@@ -330,6 +331,7 @@ impl Default for UiSettings {
             microphones: Vec::new(),
             prefix_enabled: true,
             auto_enter: false,
+            intercept_enter: true,
             sound_enabled: true,
             type_mode: false,
             autostart_enabled: false,
@@ -389,6 +391,7 @@ pub enum UiEvent {
     MicrophoneSelected(Option<String>),
     TogglePrefix,
     ToggleAutoEnter,
+    ToggleEnterInterception,
     ToggleSound,
     ToggleTypeMode,
     ToggleAutostart,
@@ -832,25 +835,41 @@ impl UiState {
                     self.show_notice(TITLE, &message);
                 }
             }
-            match unsafe {
-                RegisterHotKey(
-                    Some(self.tray_hwnd),
-                    HOTKEY_ENTER_ID,
-                    MOD_NOREPEAT,
-                    VK_RETURN.0 as u32,
-                )
-            } {
-                Ok(()) => {
-                    self.enter_registered = true;
-                    info!("registered Enter to stop and send");
-                }
-                Err(error) => {
-                    self.enter_registered = false;
-                    warn!("could not register Enter to stop and send: {error}");
-                }
-            }
+            self.update_enter_hotkey();
         } else {
             self.unregister_escape();
+        }
+    }
+
+    fn update_enter_hotkey(&mut self) {
+        if !self.recording || !self.settings.intercept_enter {
+            if self.enter_registered {
+                let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ENTER_ID) };
+                self.enter_registered = false;
+            }
+            return;
+        }
+
+        if self.enter_registered {
+            return;
+        }
+
+        match unsafe {
+            RegisterHotKey(
+                Some(self.tray_hwnd),
+                HOTKEY_ENTER_ID,
+                MOD_NOREPEAT,
+                VK_RETURN.0 as u32,
+            )
+        } {
+            Ok(()) => {
+                self.enter_registered = true;
+                info!("registered Enter to stop and send");
+            }
+            Err(error) => {
+                self.enter_registered = false;
+                warn!("could not register Enter to stop and send: {error}");
+            }
         }
     }
 
@@ -870,7 +889,17 @@ impl UiState {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
+                let enter_interception_changed =
+                    self.settings.intercept_enter != settings.intercept_enter;
                 self.settings = settings;
+                if enter_interception_changed {
+                    self.update_enter_hotkey();
+                }
+                PUSH_TO_TALK_HOOK_STATE.with(|state| {
+                    if let Some(state) = state.borrow_mut().as_mut() {
+                        state.intercept_enter = self.settings.intercept_enter;
+                    }
+                });
                 if hotkeys_changed || mode_changed {
                     self.register_hotkeys();
                     self.update_push_to_talk_hook();
@@ -1289,6 +1318,7 @@ impl UiState {
                         state.pressed_modifiers = 0;
                         state.enter_pressed = false;
                         state.recording = false;
+                        state.intercept_enter = self.settings.intercept_enter;
                     }
                 });
                 return;
@@ -1302,6 +1332,7 @@ impl UiState {
                     engaged: false,
                     enter_pressed: false,
                     recording: self.recording,
+                    intercept_enter: self.settings.intercept_enter,
                 });
             });
             match unsafe {
@@ -1344,6 +1375,7 @@ struct PushToTalkHookState {
     engaged: bool,
     enter_pressed: bool,
     recording: bool,
+    intercept_enter: bool,
 }
 
 unsafe extern "system" fn push_to_talk_keyboard_hook(
@@ -1379,15 +1411,24 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
 
         let is_enter_key = keyboard.vkCode == VK_RETURN.0 as u32;
         let is_trigger_key = keyboard.vkCode == state.hotkey.virtual_key;
-        if key_down && is_enter_key && state.engaged && state.recording {
+        if is_enter_key && state.enter_pressed {
+            // Consume repeats and pair the key-up with an intercepted key-down,
+            // even if the option was disabled while this key was held.
+            if key_up {
+                state.enter_pressed = false;
+            }
+            swallow = true;
+        } else if key_down
+            && is_enter_key
+            && state.intercept_enter
+            && state.engaged
+            && state.recording
+        {
             if !state.enter_pressed {
                 state.enter_pressed = true;
                 swallow = true;
                 let _ = state.events.send(UiEvent::EnterPressed);
             }
-        } else if key_up && is_enter_key && state.enter_pressed {
-            state.enter_pressed = false;
-            swallow = true;
         } else if key_down && is_trigger_key {
             if state.engaged {
                 swallow = true;
@@ -2042,6 +2083,14 @@ fn build_tray_menu(
     )?;
     append_check_action(
         recording_menu.0,
+        "Intercept Enter while recording",
+        20,
+        settings.intercept_enter,
+        UiEvent::ToggleEnterInterception,
+        &mut actions,
+    )?;
+    append_check_action(
+        recording_menu.0,
         "Sound cues",
         11,
         settings.sound_enabled,
@@ -2326,7 +2375,9 @@ unsafe extern "system" fn window_proc(
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE_ID => state.handle_user_event(UiEvent::ToggleRecord),
-                    HOTKEY_ENTER_ID => state.handle_user_event(UiEvent::EnterPressed),
+                    HOTKEY_ENTER_ID if state.recording && state.settings.intercept_enter => {
+                        state.handle_user_event(UiEvent::EnterPressed)
+                    }
                     HOTKEY_ESCAPE_ID => {
                         state.unregister_escape();
                         state.recording = false;

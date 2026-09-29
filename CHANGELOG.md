@@ -2,7 +2,8 @@
 
 ## v0.6.3
 
-Removes unused internal helpers; no user-visible behavior changes.
+Adds a tray option to let Enter reach the focused app while recording, and
+removes unused internal helpers.
 
 ## v0.6.2
 
