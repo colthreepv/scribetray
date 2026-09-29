@@ -2,8 +2,9 @@
 
 ## v0.6.3
 
-Adds a tray option to let Enter reach the focused app while recording, and
-removes unused internal helpers.
+Lets Shift+Enter reach the focused app while recording; a tray option controls
+whether plain Enter stops and sends the transcription. Removes unused internal
+helpers.
 
 ## v0.6.2
 

@@ -46,8 +46,8 @@ use windows::{
                 GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI, SystemParametersInfoForDpi,
             },
             Input::KeyboardAndMouse::{
-                MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-                UnregisterHotKey, VK_ESCAPE, VK_RETURN,
+                GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+                RegisterHotKey, UnregisterHotKey, VK_ESCAPE, VK_RETURN, VK_SHIFT,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
@@ -82,9 +82,9 @@ const TITLE: &str = "Scribetray";
 const TRAY_ICON_ID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const WAKE_COMMANDS: u32 = WM_APP + 2;
+const RELEASE_ENTER_HOOK: u32 = WM_APP + 3;
 const HOTKEY_TOGGLE_ID: i32 = 0x5343;
 const HOTKEY_ESCAPE_ID: i32 = 0x5345;
-const HOTKEY_ENTER_ID: i32 = 0x5346;
 /// Ticks the tray tooltip once per second while recording.
 const TIMER_RECORDING: usize = 0x5343;
 /// Advances the caret overlay animation while it is visible.
@@ -168,7 +168,7 @@ const fn tray_icon_id(state: TrayState, theme: TrayTheme) -> u32 {
 }
 
 thread_local! {
-    static PUSH_TO_TALK_HOOK_STATE: RefCell<Option<PushToTalkHookState>> = const { RefCell::new(None) };
+    static KEYBOARD_HOOK_STATE: RefCell<Option<KeyboardHookState>> = const { RefCell::new(None) };
 }
 
 /// Modifier keys for a configurable global hotkey.
@@ -528,7 +528,6 @@ struct UiState {
     tray_tooltip: String,
     toggle_registered: bool,
     escape_registered: bool,
-    enter_registered: bool,
     recording: bool,
     shutting_down: bool,
     anchor_rect: Option<CaretRect>,
@@ -547,7 +546,7 @@ struct UiState {
     overlay_dpi_scale: f32,
     overlay_shown_at: Instant,
     overlay_state_since: Instant,
-    push_to_talk_hook: Option<HHOOK>,
+    keyboard_hook: Option<HHOOK>,
 }
 
 fn run_ui_thread(
@@ -566,7 +565,7 @@ fn run_ui_thread(
 
     let hwnd = state.tray_hwnd.0 as isize;
     state.register_hotkeys();
-    state.update_push_to_talk_hook();
+    state.update_keyboard_hook();
     state.refresh_tray();
     let _ = ready.send(Ok(hwnd));
 
@@ -663,13 +662,12 @@ fn create_ui_state(
         overlay_state_since: Instant::now(),
         toggle_registered: false,
         escape_registered: false,
-        enter_registered: false,
         recording: false,
         shutting_down: false,
         anchor_rect: None,
         anchor_status: None,
         recording_started: None,
-        push_to_talk_hook: None,
+        keyboard_hook: None,
     });
     let state_ptr = (&mut *state as *mut UiState).cast::<core::ffi::c_void>();
     let class_name = PCWSTR(state.class_name.as_ptr());
@@ -807,7 +805,7 @@ impl UiState {
             return;
         }
         self.recording = recording;
-        PUSH_TO_TALK_HOOK_STATE.with(|state| {
+        KEYBOARD_HOOK_STATE.with(|state| {
             if let Some(state) = state.borrow_mut().as_mut() {
                 state.recording = recording;
             }
@@ -835,52 +833,16 @@ impl UiState {
                     self.show_notice(TITLE, &message);
                 }
             }
-            self.update_enter_hotkey();
         } else {
             self.unregister_escape();
         }
-    }
-
-    fn update_enter_hotkey(&mut self) {
-        if !self.recording || !self.settings.intercept_enter {
-            if self.enter_registered {
-                let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ENTER_ID) };
-                self.enter_registered = false;
-            }
-            return;
-        }
-
-        if self.enter_registered {
-            return;
-        }
-
-        match unsafe {
-            RegisterHotKey(
-                Some(self.tray_hwnd),
-                HOTKEY_ENTER_ID,
-                MOD_NOREPEAT,
-                VK_RETURN.0 as u32,
-            )
-        } {
-            Ok(()) => {
-                self.enter_registered = true;
-                info!("registered Enter to stop and send");
-            }
-            Err(error) => {
-                self.enter_registered = false;
-                warn!("could not register Enter to stop and send: {error}");
-            }
-        }
+        self.update_keyboard_hook();
     }
 
     fn unregister_escape(&mut self) {
         if self.escape_registered {
             let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ESCAPE_ID) };
             self.escape_registered = false;
-        }
-        if self.enter_registered {
-            let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ENTER_ID) };
-            self.enter_registered = false;
         }
     }
 
@@ -889,21 +851,23 @@ impl UiState {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
-                let enter_interception_changed =
-                    self.settings.intercept_enter != settings.intercept_enter;
                 self.settings = settings;
-                if enter_interception_changed {
-                    self.update_enter_hotkey();
-                }
-                PUSH_TO_TALK_HOOK_STATE.with(|state| {
+                KEYBOARD_HOOK_STATE.with(|state| {
                     if let Some(state) = state.borrow_mut().as_mut() {
+                        if hotkeys_changed || mode_changed {
+                            state.hotkey = self.settings.toggle_hotkey.clone();
+                            state.engaged = false;
+                            state.pressed_modifiers = 0;
+                        }
+                        state.push_to_talk = self.settings.push_to_talk;
+                        state.recording = self.recording;
                         state.intercept_enter = self.settings.intercept_enter;
                     }
                 });
                 if hotkeys_changed || mode_changed {
                     self.register_hotkeys();
-                    self.update_push_to_talk_hook();
                 }
+                self.update_keyboard_hook();
                 self.refresh_tray();
             }
             UiCommand::SetUsage(usage) => self.usage = usage,
@@ -1272,7 +1236,7 @@ impl UiState {
     }
 
     fn cleanup(&mut self) {
-        self.remove_push_to_talk_hook();
+        self.remove_keyboard_hook();
         self.unregister_escape();
         self.unregister_record_hotkeys();
         self.level_meter = None;
@@ -1308,44 +1272,55 @@ impl UiState {
         }
     }
 
-    fn update_push_to_talk_hook(&mut self) {
-        if self.settings.push_to_talk {
-            if self.push_to_talk_hook.is_some() {
-                PUSH_TO_TALK_HOOK_STATE.with(|state| {
-                    if let Some(state) = state.borrow_mut().as_mut() {
-                        state.hotkey = self.settings.toggle_hotkey.clone();
-                        state.engaged = false;
-                        state.pressed_modifiers = 0;
-                        state.enter_pressed = false;
-                        state.recording = false;
-                        state.intercept_enter = self.settings.intercept_enter;
-                    }
-                });
-                return;
-            }
+    fn update_keyboard_hook(&mut self) {
+        let held_enter_needs_pairing = KEYBOARD_HOOK_STATE.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.enter_pressed || state.shifted_enter_pressed)
+        });
+        let should_install = self.settings.push_to_talk
+            || (self.recording && self.settings.intercept_enter)
+            || held_enter_needs_pairing;
 
-            PUSH_TO_TALK_HOOK_STATE.with(|state| {
-                *state.borrow_mut() = Some(PushToTalkHookState {
-                    events: self.events.clone(),
-                    hotkey: self.settings.toggle_hotkey.clone(),
-                    pressed_modifiers: 0,
-                    engaged: false,
-                    enter_pressed: false,
-                    recording: self.recording,
-                    intercept_enter: self.settings.intercept_enter,
-                });
+        if !should_install {
+            self.remove_keyboard_hook();
+            return;
+        }
+
+        if self.keyboard_hook.is_some() {
+            KEYBOARD_HOOK_STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.hotkey = self.settings.toggle_hotkey.clone();
+                    state.push_to_talk = self.settings.push_to_talk;
+                    state.recording = self.recording;
+                    state.intercept_enter = self.settings.intercept_enter;
+                }
             });
-            match unsafe {
-                SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(push_to_talk_keyboard_hook),
-                    Some(self.instance),
-                    0,
-                )
-            } {
-                Ok(hook) => self.push_to_talk_hook = Some(hook),
-                Err(error) => {
-                    PUSH_TO_TALK_HOOK_STATE.with(|state| *state.borrow_mut() = None);
+            return;
+        }
+
+        KEYBOARD_HOOK_STATE.with(|state| {
+            *state.borrow_mut() = Some(KeyboardHookState {
+                events: self.events.clone(),
+                tray_hwnd: self.tray_hwnd,
+                hotkey: self.settings.toggle_hotkey.clone(),
+                pressed_modifiers: 0,
+                engaged: false,
+                push_to_talk: self.settings.push_to_talk,
+                enter_pressed: false,
+                shifted_enter_pressed: false,
+                recording: self.recording,
+                intercept_enter: self.settings.intercept_enter,
+            });
+        });
+        match unsafe {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(self.instance), 0)
+        } {
+            Ok(hook) => self.keyboard_hook = Some(hook),
+            Err(error) => {
+                KEYBOARD_HOOK_STATE.with(|state| *state.borrow_mut() = None);
+                if self.settings.push_to_talk {
                     let _ = self.events.send(UiEvent::PushToTalkHookFailed {
                         error: format!("Could not enable push-to-talk keyboard capture: {error}"),
                     });
@@ -1353,36 +1328,39 @@ impl UiState {
                         TITLE,
                         "Could not enable push-to-talk keyboard capture. Toggle mode remains available.",
                     );
+                } else {
+                    warn!("could not enable Enter interception keyboard hook: {error}");
+                    self.show_notice(
+                        TITLE,
+                        "Could not enable Enter interception. Enter will pass through while recording.",
+                    );
                 }
             }
-        } else {
-            self.remove_push_to_talk_hook();
         }
     }
 
-    fn remove_push_to_talk_hook(&mut self) {
-        if let Some(hook) = self.push_to_talk_hook.take() {
+    fn remove_keyboard_hook(&mut self) {
+        if let Some(hook) = self.keyboard_hook.take() {
             let _ = unsafe { UnhookWindowsHookEx(hook) };
         }
-        PUSH_TO_TALK_HOOK_STATE.with(|state| *state.borrow_mut() = None);
+        KEYBOARD_HOOK_STATE.with(|state| *state.borrow_mut() = None);
     }
 }
 
-struct PushToTalkHookState {
+struct KeyboardHookState {
     events: Sender<UiEvent>,
+    tray_hwnd: HWND,
     hotkey: Hotkey,
     pressed_modifiers: u8,
     engaged: bool,
+    push_to_talk: bool,
     enter_pressed: bool,
+    shifted_enter_pressed: bool,
     recording: bool,
     intercept_enter: bool,
 }
 
-unsafe extern "system" fn push_to_talk_keyboard_hook(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -1396,10 +1374,10 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
     }
 
     let mut swallow = false;
-    PUSH_TO_TALK_HOOK_STATE.with(|state| {
+    let (release_idle_hook, tray_hwnd) = KEYBOARD_HOOK_STATE.with(|state| {
         let mut slot = state.borrow_mut();
         let Some(state) = slot.as_mut() else {
-            return;
+            return (false, HWND::default());
         };
         if let Some(bit) = modifier_bit(keyboard.vkCode) {
             if key_down {
@@ -1411,6 +1389,8 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
 
         let is_enter_key = keyboard.vkCode == VK_RETURN.0 as u32;
         let is_trigger_key = keyboard.vkCode == state.hotkey.virtual_key;
+        let shift_is_pressed = state.pressed_modifiers & 0b1100_0000 != 0
+            || unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
         if is_enter_key && state.enter_pressed {
             // Consume repeats and pair the key-up with an intercepted key-down,
             // even if the option was disabled while this key was held.
@@ -1418,18 +1398,24 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
                 state.enter_pressed = false;
             }
             swallow = true;
+        } else if is_enter_key && state.shifted_enter_pressed {
+            // Keep the whole Shift+Enter stroke passed through if Shift is
+            // released before Windows delivers the key-up or a repeat.
+            if key_up {
+                state.shifted_enter_pressed = false;
+            }
+        } else if key_down && is_enter_key && state.recording && shift_is_pressed {
+            state.shifted_enter_pressed = true;
         } else if key_down
             && is_enter_key
             && state.intercept_enter
-            && state.engaged
             && state.recording
+            && (!state.push_to_talk || state.engaged)
         {
-            if !state.enter_pressed {
-                state.enter_pressed = true;
-                swallow = true;
-                let _ = state.events.send(UiEvent::EnterPressed);
-            }
-        } else if key_down && is_trigger_key {
+            state.enter_pressed = true;
+            swallow = true;
+            let _ = state.events.send(UiEvent::EnterPressed);
+        } else if state.push_to_talk && key_down && is_trigger_key {
             if state.engaged {
                 swallow = true;
             } else if modifiers_match(state) {
@@ -1437,7 +1423,8 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
                 swallow = true;
                 let _ = state.events.send(UiEvent::PushToTalkPressed);
             }
-        } else if state.engaged
+        } else if state.push_to_talk
+            && state.engaged
             && ((key_up && is_trigger_key) || (key_up && !modifiers_match(state)))
         {
             state.engaged = false;
@@ -1446,7 +1433,17 @@ unsafe extern "system" fn push_to_talk_keyboard_hook(
             }
             let _ = state.events.send(UiEvent::PushToTalkReleased);
         }
+
+        let release_idle_hook = !state.push_to_talk
+            && !state.recording
+            && !state.enter_pressed
+            && !state.shifted_enter_pressed;
+        (release_idle_hook, state.tray_hwnd)
     });
+
+    if release_idle_hook {
+        let _ = unsafe { PostMessageW(Some(tray_hwnd), RELEASE_ENTER_HOOK, WPARAM(0), LPARAM(0)) };
+    }
 
     if swallow {
         LRESULT(1)
@@ -1472,7 +1469,7 @@ fn modifier_bit(virtual_key: u32) -> Option<u8> {
     }
 }
 
-fn modifiers_match(state: &PushToTalkHookState) -> bool {
+fn modifiers_match(state: &KeyboardHookState) -> bool {
     let pressed = state.pressed_modifiers;
     let actual = [
         pressed & 0b0000_0011 != 0,
@@ -2375,21 +2372,23 @@ unsafe extern "system" fn window_proc(
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE_ID => state.handle_user_event(UiEvent::ToggleRecord),
-                    HOTKEY_ENTER_ID if state.recording && state.settings.intercept_enter => {
-                        state.handle_user_event(UiEvent::EnterPressed)
-                    }
                     HOTKEY_ESCAPE_ID => {
                         state.unregister_escape();
                         state.recording = false;
-                        PUSH_TO_TALK_HOOK_STATE.with(|hook_state| {
+                        KEYBOARD_HOOK_STATE.with(|hook_state| {
                             if let Some(hook_state) = hook_state.borrow_mut().as_mut() {
                                 hook_state.recording = false;
                             }
                         });
+                        state.update_keyboard_hook();
                         state.handle_user_event(UiEvent::CancelRecord);
                     }
                     _ => {}
                 }
+                return LRESULT(0);
+            }
+            RELEASE_ENTER_HOOK => {
+                state.update_keyboard_hook();
                 return LRESULT(0);
             }
             WM_CLOSE => {

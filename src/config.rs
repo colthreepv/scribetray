@@ -42,7 +42,7 @@ prefix = "🎙️ "
 prefix_enabled = true
 # Submit the text after insertion for every recording.
 auto_enter = false
-# Intercept Enter while recording to stop and send the transcription.
+# Intercept plain Enter while recording; Shift+Enter always passes through.
 intercept_enter = true
 # Insert transcripts by simulated typing or clipboard paste.
 insert_method = "type"
@@ -82,7 +82,7 @@ pub struct Config {
     pub prefix: String,
     pub prefix_enabled: bool,
     pub auto_enter: bool,
-    /// Intercept Enter during recording to stop and send the transcription.
+    /// Intercept plain Enter during recording; Shift+Enter passes through.
     pub intercept_enter: bool,
     /// Transcript insertion strategy (for example, `paste` or `type`).
     pub insert_method: String,
