@@ -1,6 +1,5 @@
 # Scribetray v{{VERSION}}
 
-<!-- Replace with 1–3 concise, agent-written sentences about user-visible changes. -->
 {{SUMMARY}}
 
 ## Download
