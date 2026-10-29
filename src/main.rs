@@ -8,9 +8,11 @@ mod autostart;
 mod config;
 mod history;
 mod hotkey_dialog;
+mod openai;
 mod realtime;
 mod scribe;
 mod subscription;
+mod transcription;
 mod windows_ui;
 mod wininput;
 
@@ -28,10 +30,10 @@ use std::{
 };
 
 use audio::AudioRecorder;
-use config::{Config, config_path};
+use config::{Config, Provider, config_path};
 use directories::BaseDirs;
 use history::{History, Recording, RecordingStatus};
-use scribe::{ScribeClient, Transcription};
+use scribe::Transcription;
 use tracing::{error, info, warn};
 use windows::{
     Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
@@ -49,6 +51,7 @@ const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
 const CUE_SAMPLE_RATE: u32 = 22_050;
 const SUBSCRIPTION_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
 
@@ -84,8 +87,9 @@ impl SubscriptionCache {
         self.last_attempt = None;
         self.fetching = false;
         self.permission_denied = false;
-        let fingerprint = config
-            .resolved_api_key()
+        let fingerprint = (config.provider == Provider::Elevenlabs)
+            .then(|| config.resolved_api_key())
+            .flatten()
             .as_deref()
             .map(api_key_fingerprint);
         if fingerprint != self.api_key_fingerprint {
@@ -102,7 +106,7 @@ impl SubscriptionCache {
         finished_tx: &Sender<SubscriptionFinished>,
         force: bool,
     ) {
-        if self.fetching || self.permission_denied {
+        if config.provider != Provider::Elevenlabs || self.fetching || self.permission_denied {
             return;
         }
         let Some(api_key) = config.resolved_api_key() else {
@@ -168,6 +172,7 @@ enum Delivery {
 
 struct ActiveRecording {
     recorder: AudioRecorder,
+    config: Config,
     realtime_result: Option<Receiver<Result<Transcription, String>>>,
     target: TargetSnapshot,
     started: Instant,
@@ -251,7 +256,7 @@ fn run() -> Result<(), String> {
     let mut ui_settings =
         make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
     let ui = UiRuntime::start(ui_settings.clone())?;
-    if config.resolved_api_key().is_none() {
+    if config.provider == Provider::Elevenlabs && config.resolved_api_key().is_none() {
         show_notice(
             &ui,
             "Scribetray setup",
@@ -267,10 +272,24 @@ fn run() -> Result<(), String> {
     let mut deliveries: HashMap<String, Delivery> = HashMap::new();
     let mut submit_after_transcription: HashMap<String, bool> = HashMap::new();
     let mut done_until: Option<Instant> = None;
+    let mut account_refresh = Instant::now();
 
     info!("Scribetray started");
     loop {
-        match ui.events.recv_timeout(TICK) {
+        let event = ui.events.recv_timeout(TICK);
+        if active.is_none()
+            && let Some(updated) = config_monitor.load_if_changed(&config)
+        {
+            config = updated;
+            subscription_cache.reset_for_config(&config, &ui, &subscription_tx);
+            let microphones = ui_settings.microphones.clone();
+            ui_settings =
+                make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
+            if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
+                warn!("could not apply reloaded settings: {error}");
+            }
+        }
+        match event {
             Ok(UiEvent::UsageRefreshRequested) => {
                 subscription_cache.refresh(&config, &subscription_tx, false);
             }
@@ -325,16 +344,14 @@ fn run() -> Result<(), String> {
             &mut done_until,
         );
         update_timers(&ui, active.as_mut(), &mut done_until);
-        if active.is_none()
-            && let Some(updated) = config_monitor.load_if_changed(&config)
+        if config.provider == Provider::Openai
+            && account_refresh.elapsed() >= ACCOUNT_REFRESH_INTERVAL
         {
-            config = updated;
-            subscription_cache.reset_for_config(&config, &ui, &subscription_tx);
-            let microphones = ui_settings.microphones.clone();
-            ui_settings =
-                make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
-            if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
-                warn!("could not apply reloaded settings: {error}");
+            account_refresh = Instant::now();
+            let account = transcription::account_state(&config);
+            if account != ui_settings.account {
+                ui_settings.account = account;
+                let _ = ui.send(UiCommand::SetSettings(ui_settings.clone()));
             }
         }
     }
@@ -466,8 +483,10 @@ fn handle_ui_event(
             save_config(config, ui);
         }
         UiEvent::ToggleRealtime => {
-            config.realtime = !config.realtime;
-            save_config(config, ui);
+            if config.provider == Provider::Elevenlabs {
+                config.realtime = !config.realtime;
+                save_config(config, ui);
+            }
         }
         UiEvent::MicrophoneSelected(microphone) => {
             config.microphone = microphone.filter(|name| !name.trim().is_empty());
@@ -655,6 +674,11 @@ fn start_recording(
     ui: &UiRuntime,
     done_until: &mut Option<Instant>,
 ) {
+    let account = transcription::account_state(config);
+    if !account.ready {
+        show_notice(ui, "Scribetray setup", account.unavailable_reason);
+        return;
+    }
     let target = match wininput::capture_target() {
         Ok(target) => target,
         Err(error) => {
@@ -666,7 +690,8 @@ fn start_recording(
             return;
         }
     };
-    let (recorder, realtime_result) = if config.realtime
+    let (recorder, realtime_result) = if config.provider == Provider::Elevenlabs
+        && config.realtime
         && let Some(api_key) = config.resolved_api_key()
     {
         let keyterms = match realtime::validate_keyterms(&config.keyterms) {
@@ -731,11 +756,16 @@ fn start_recording(
     let caret = target.caret;
     info!(
         "recording started; transcription mode={}; caret method={:?}",
-        if config.realtime { "realtime" } else { "batch" },
+        if config.provider == Provider::Elevenlabs && config.realtime {
+            "realtime"
+        } else {
+            "batch"
+        },
         caret.map(|item| item.method)
     );
     *active = Some(ActiveRecording {
         recorder,
+        config: config.clone(),
         realtime_result,
         target,
         started: Instant::now(),
@@ -764,6 +794,7 @@ fn stop_recording(
     };
     let target = active_recording.target;
     let realtime_result = active_recording.realtime_result;
+    let recording_config = active_recording.config;
     let enter_after = send_enter_after;
     let captured = match active_recording.recorder.stop() {
         Ok(captured) => captured,
@@ -794,7 +825,7 @@ fn stop_recording(
                     realtime_result,
                     Delivery::Paste(target),
                     enter_after,
-                    config,
+                    &recording_config,
                     ui,
                     history,
                     worker_tx,
@@ -807,7 +838,7 @@ fn stop_recording(
                     captured.pcm_16k_mono,
                     Delivery::Paste(target),
                     enter_after,
-                    config,
+                    &recording_config,
                     ui,
                     history,
                     worker_tx,
@@ -856,8 +887,7 @@ fn start_streaming_transcription(
     let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
 
     let sender = worker_tx.clone();
-    let api_key = config.resolved_api_key();
-    let model = config.model.clone();
+    let job_config = config.clone();
     let language = language_for_api(&config.language);
     let job_id = id.clone();
     let task = thread::Builder::new()
@@ -870,18 +900,8 @@ fn start_streaming_transcription(
                 Ok(transcription) => Ok(transcription),
                 Err(realtime_error) => {
                     warn!("Realtime transcription failed ({realtime_error}); retrying the complete audio with batch Scribe");
-                    match api_key {
-                        Some(api_key) => ScribeClient::new()
-                            .and_then(|client| {
-                                client.transcribe(&api_key, &pcm, &model, language.as_deref())
-                            })
-                            .map_err(|batch_error| {
-                                format!(
-                                    "Realtime transcription failed ({realtime_error}); batch retry failed ({batch_error})."
-                                )
-                            }),
-                        None => Err("ELEVENLABS_API_KEY is not configured".to_owned()),
-                    }
+                    transcription::transcribe(&job_config, &pcm, language.as_deref())
+                        .map_err(|batch_error| format!("Realtime transcription failed ({realtime_error}); batch retry failed ({batch_error})."))
                 }
             };
             let _ = sender.send(WorkerFinished {
@@ -936,21 +956,13 @@ fn start_transcription(
     let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
 
     let sender = worker_tx.clone();
-    let api_key = config.resolved_api_key();
-    let model = config.model.clone();
+    let job_config = config.clone();
     let language = language_for_api(&config.language);
     let job_id = id.clone();
     let task = thread::Builder::new()
         .name("scribetray-transcription".to_owned())
         .spawn(move || {
-            let result = match api_key {
-                Some(api_key) => ScribeClient::new()
-                    .and_then(|client| {
-                        client.transcribe(&api_key, &pcm, &model, language.as_deref())
-                    })
-                    .map_err(|error| error.to_string()),
-                None => Err("ELEVENLABS_API_KEY is not configured".to_owned()),
-            };
+            let result = transcription::transcribe(&job_config, &pcm, language.as_deref());
             let _ = sender.send(WorkerFinished {
                 history_id: job_id,
                 result,
@@ -1049,7 +1061,7 @@ fn complete_transcription(
         show_notice(
             ui,
             "Scribetray",
-            "Scribe returned no text for this recording.",
+            "Transcription returned no text for this recording.",
         );
         return;
     }
@@ -1233,7 +1245,8 @@ fn make_ui_settings(
         push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
         max_seconds: config.max_seconds,
         realtime_enabled: config.realtime,
-        api_key_configured: config.resolved_api_key().is_some(),
+        provider: config.provider,
+        account: transcription::account_state(config),
         scribe_credits_per_hour: config.scribe_credits_per_hour,
         selected_microphone: config.microphone.clone(),
         microphones,
@@ -1263,7 +1276,7 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.max_seconds == 0 {
         return Err("max_seconds must be greater than zero".to_owned());
     }
-    if config.scribe_credits_per_hour == 0 {
+    if config.provider == Provider::Elevenlabs && config.scribe_credits_per_hour == 0 {
         return Err("scribe_credits_per_hour must be greater than zero".to_owned());
     }
     if !config.mode.eq_ignore_ascii_case("toggle")
@@ -1276,7 +1289,9 @@ fn validate_config(config: &Config) -> Result<(), String> {
     {
         return Err("insert_method must be either paste or type".to_owned());
     }
-    realtime::validate_keyterms(&config.keyterms).map_err(|error| error.to_string())?;
+    if config.provider == Provider::Elevenlabs {
+        realtime::validate_keyterms(&config.keyterms).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1545,4 +1560,25 @@ unsafe extern "system" {
         title: *const u16,
         kind: u32,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod provider_validation_tests {
+    use super::*;
+
+    #[test]
+    fn elevenlabs_options_are_ignored_by_openai_validation() {
+        let mut config = Config {
+            provider: Provider::Openai,
+            scribe_credits_per_hour: 0,
+            keyterms: vec![String::new()],
+            realtime: true,
+            ..Config::default()
+        };
+        assert!(validate_config(&config).is_ok());
+        config.provider = Provider::Elevenlabs;
+        assert!(validate_config(&config).is_err());
+        config.scribe_credits_per_hour = 585;
+        assert!(validate_config(&config).is_err());
+    }
 }

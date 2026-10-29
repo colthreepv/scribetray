@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $repoRoot 'Cargo.toml'
+. (Join-Path $PSScriptRoot 'native-tools.ps1')
 $configPath = Join-Path $env:APPDATA 'Scribetray\deploy.json'
 $config = [pscustomobject]@{}
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.0
+
+Adds OpenAI batch dictation using the ChatGPT session saved by Codex app or
+CLI. Choose the provider in settings; the tray shows the detected account and
+cached plan. ElevenLabs remains the default, including its optional realtime
+mode. Scribetray reads existing Codex credentials without renewing them.
+
+Windows releases include the C/C++ runtime in the executable. Building from
+source now requires Rust 1.98 and the native BoringSSL build tools.
+
 ## v0.6.3
 
 Lets Shift+Enter reach the focused app while recording; a tray option controls

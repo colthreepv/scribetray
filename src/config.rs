@@ -21,6 +21,8 @@ pub const DEFAULT_LANGUAGE_CODE: &str = "auto";
 pub const DEFAULT_MODEL: &str = "scribe_v2";
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Scribetray settings. Save this file to apply changes.
+# Transcription provider: "elevenlabs" or "openai" (uses the Codex session).
+provider = "elevenlabs"
 # Create a restricted ElevenLabs API key with Speech to Text permission.
 # User → Read is optional and enables the usage header in the tray menu.
 # Alternatively, set ELEVENLABS_API_KEY in your environment.
@@ -63,6 +65,7 @@ start_with_windows = false
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
+    pub provider: Provider,
     /// Optional fallback when `ELEVENLABS_API_KEY` is not set.
     pub api_key: Option<String>,
     /// Main global recording hotkey.
@@ -100,6 +103,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Config")
+            .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("hotkey", &self.hotkey)
             .field("mode", &self.mode)
@@ -125,6 +129,7 @@ impl fmt::Debug for Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            provider: Provider::Elevenlabs,
             api_key: None,
             hotkey: "Win+Alt+V".to_owned(),
             mode: "toggle".to_owned(),
@@ -145,6 +150,14 @@ impl Default for Config {
             start_with_windows: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Elevenlabs,
+    Openai,
 }
 
 impl Config {
@@ -246,4 +259,21 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("could not serialize config TOML")]
     Serialize(#[from] toml::ser::Error),
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+
+    #[test]
+    fn missing_provider_defaults_to_elevenlabs_and_roundtrips() {
+        let old: Config = toml::from_str("realtime = true\n").unwrap();
+        assert_eq!(old.provider, Provider::Elevenlabs);
+        let openai: Config = toml::from_str("provider = 'openai'\nrealtime = true\n").unwrap();
+        assert_eq!(openai.provider, Provider::Openai);
+        assert!(openai.realtime);
+        let restored: Config = toml::from_str(&toml::to_string(&openai).unwrap()).unwrap();
+        assert_eq!(restored, openai);
+        assert!(toml::from_str::<Config>("provider = 'other'").is_err());
+    }
 }

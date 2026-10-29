@@ -1,0 +1,4 @@
+# Include the C/C++ runtime in Windows binaries. Only Windows system DLLs
+# should be required by the downloadable executable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

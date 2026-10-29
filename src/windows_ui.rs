@@ -301,8 +301,8 @@ pub struct UiSettings {
     pub push_to_talk: bool,
     pub max_seconds: u32,
     pub realtime_enabled: bool,
-    /// Whether an ElevenLabs API key is resolved from the environment or config.
-    pub api_key_configured: bool,
+    pub provider: crate::config::Provider,
+    pub account: crate::transcription::AccountState,
     /// Estimated batch Scribe credits spent per recording hour.
     pub scribe_credits_per_hour: u32,
     pub selected_microphone: Option<String>,
@@ -325,7 +325,13 @@ impl Default for UiSettings {
             push_to_talk: false,
             max_seconds: 600,
             realtime_enabled: false,
-            api_key_configured: false,
+            provider: crate::config::Provider::Elevenlabs,
+            account: crate::transcription::AccountState {
+                ready: false,
+                header: None,
+                detail: None,
+                unavailable_reason: "Set an API key in settings",
+            },
             scribe_credits_per_hour: 585,
             selected_microphone: None,
             microphones: Vec::new(),
@@ -851,6 +857,9 @@ impl UiState {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
+                if settings.provider != crate::config::Provider::Elevenlabs {
+                    self.usage = None;
+                }
                 self.settings = settings;
                 KEYBOARD_HOOK_STATE.with(|state| {
                     if let Some(state) = state.borrow_mut().as_mut() {
@@ -870,7 +879,11 @@ impl UiState {
                 self.update_keyboard_hook();
                 self.refresh_tray();
             }
-            UiCommand::SetUsage(usage) => self.usage = usage,
+            UiCommand::SetUsage(usage) => {
+                if self.settings.provider == crate::config::Provider::Elevenlabs {
+                    self.usage = usage;
+                }
+            }
             UiCommand::UpdateHistory(history) => self.settings.history = history,
             UiCommand::SetRecording(recording) => {
                 self.set_recording(recording);
@@ -1062,7 +1075,7 @@ impl UiState {
 
     /// Whether Scribetray has the minimum setup needed to start a recording.
     fn tray_setup_ready(&self) -> bool {
-        self.settings.api_key_configured
+        self.settings.account.ready
             && !self.settings.microphones.is_empty()
             && (self.settings.push_to_talk || self.toggle_registered)
     }
@@ -1164,6 +1177,10 @@ impl UiState {
     }
 
     fn show_menu(&mut self) {
+        if self.settings.provider == crate::config::Provider::Openai {
+            self.settings.account =
+                crate::transcription::openai_account_state(crate::openai::session_status());
+        }
         self.clear_tray_error();
         self.refresh_tray();
         self.handle_user_event(UiEvent::UsageRefreshRequested);
@@ -1912,10 +1929,16 @@ fn build_tray_menu(
     let root = MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
     let mut actions = HashMap::new();
     let mut next_dynamic_id = 100_u32;
-    let setup_ready = settings.api_key_configured;
+    let setup_ready = settings.account.ready || recording;
     let toggle_label = settings.toggle_hotkey.combo_label();
 
-    if let Some(item_data) = usage_header_data {
+    if let Some(header) = &settings.account.header {
+        append_flags(root.0, MF_GRAYED, 0, &identity_menu_label(header))?;
+        if let Some(detail) = &settings.account.detail {
+            append_flags(root.0, MF_GRAYED, 0, &identity_menu_label(detail))?;
+        }
+        append_separator(root.0)?;
+    } else if let Some(item_data) = usage_header_data {
         let item = MENUITEMINFOW {
             cbSize: size_of::<MENUITEMINFOW>() as u32,
             fMask: MIIM_FTYPE | MIIM_STATE | MIIM_DATA | MIIM_ID,
@@ -1953,7 +1976,11 @@ fn build_tray_menu(
         default_id = 3;
         append_action(
             root.0,
-            "Set API key…",
+            if settings.provider == crate::config::Provider::Openai {
+                "Open settings file…"
+            } else {
+                "Set API key…"
+            },
             default_id,
             UiEvent::OpenConfig,
             &mut actions,
@@ -2070,14 +2097,16 @@ fn build_tray_menu(
         &mut actions,
     )?;
     append_separator(recording_menu.0)?;
-    append_check_action(
-        recording_menu.0,
-        "Realtime transcription",
-        10,
-        settings.realtime_enabled,
-        UiEvent::ToggleRealtime,
-        &mut actions,
-    )?;
+    if settings.provider == crate::config::Provider::Elevenlabs {
+        append_check_action(
+            recording_menu.0,
+            "Realtime transcription",
+            10,
+            settings.realtime_enabled,
+            UiEvent::ToggleRealtime,
+            &mut actions,
+        )?;
+    }
     append_check_action(
         recording_menu.0,
         "Intercept Enter while recording",
@@ -2278,6 +2307,35 @@ fn truncate_menu_label(label: &str) -> String {
         }
         output.push(character);
         units += character_units;
+    }
+    output
+}
+
+/// Keep externally supplied account text on one menu line, with no mnemonic.
+fn identity_menu_label(label: &str) -> String {
+    const MAX_UNITS: usize = 72;
+    let mut output = String::new();
+    let mut units = 0;
+    for character in label.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        let width = if character == '&' {
+            2
+        } else {
+            character.len_utf16()
+        };
+        if units + width > MAX_UNITS {
+            output.push('…');
+            break;
+        }
+        output.push(character);
+        if character == '&' {
+            output.push('&');
+        }
+        units += width;
     }
     output
 }
@@ -3130,8 +3188,8 @@ fn tray_tooltip_text(
 
 /// Explains why the tray is in the off state, or an empty string when ready.
 fn tray_off_reason(settings: &UiSettings, toggle_registered: bool) -> &'static str {
-    if !settings.api_key_configured {
-        "Set an API key in settings"
+    if !settings.account.ready {
+        settings.account.unavailable_reason
     } else if settings.microphones.is_empty() {
         "No input device found · open settings"
     } else if !(settings.push_to_talk || toggle_registered) {
@@ -3155,4 +3213,148 @@ fn copy_wide<const N: usize>(text: &str, destination: &mut [u16; N]) {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod provider_menu_tests {
+    use super::*;
+    use crate::{config::Provider, openai::SessionStatus, transcription::openai_account_state};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMenuItemCount, GetMenuState, GetMenuStringW, GetSubMenu, HMENU, MF_BYPOSITION, MF_GRAYED,
+    };
+
+    fn labels(menu: HMENU) -> Vec<String> {
+        let count = unsafe { GetMenuItemCount(Some(menu)) };
+        assert!(count >= 0);
+        (0..count)
+            .map(|position| {
+                let mut text = [0_u16; 512];
+                let len = unsafe {
+                    GetMenuStringW(menu, position as u32, Some(&mut text), MF_BYPOSITION)
+                };
+                String::from_utf16_lossy(&text[..len.max(0) as usize])
+            })
+            .collect()
+    }
+
+    fn submenu(menu: HMENU, title: &str) -> HMENU {
+        let position = labels(menu)
+            .iter()
+            .position(|item| item == title)
+            .expect("missing submenu");
+        let child = unsafe { GetSubMenu(menu, position as i32) };
+        assert!(!child.0.is_null());
+        child
+    }
+
+    fn assert_disabled(menu: HMENU, position: usize) {
+        let state = unsafe { GetMenuState(menu, position as u32, MF_BYPOSITION) };
+        assert_ne!(state, u32::MAX);
+        assert_ne!(state & MF_GRAYED.0, 0);
+    }
+
+    #[test]
+    fn openai_ready_menu_shows_identity_and_enables_recording() {
+        let settings = UiSettings {
+            provider: Provider::Openai,
+            account: openai_account_state(SessionStatus::Ready {
+                email: Some("user@example.com".into()),
+                plan: Some("plus".into()),
+            }),
+            realtime_enabled: true,
+            ..UiSettings::default()
+        };
+        let (menu, actions) = build_tray_menu(&settings, false, None).unwrap();
+        let root = labels(menu.0);
+        assert_eq!(&root[..2], ["OpenAI · Plus", "user@example.com"]);
+        assert_disabled(menu.0, 0);
+        assert_disabled(menu.0, 1);
+        assert!(
+            root.iter()
+                .any(|label| label.starts_with("Start recording"))
+        );
+        assert!(
+            actions
+                .values()
+                .any(|event| *event == UiEvent::ToggleRecord)
+        );
+        assert!(
+            !labels(submenu(menu.0, "Recording"))
+                .iter()
+                .any(|item| item == "Realtime transcription")
+        );
+        assert!(!root.iter().any(|label| label.contains("credits")));
+    }
+
+    #[test]
+    fn openai_missing_and_expired_disable_recording_keep_settings() {
+        for (status, detail) in [
+            (SessionStatus::Missing, "Open Codex to sign in"),
+            (SessionStatus::Expired, "Session expired · open Codex"),
+        ] {
+            let settings = UiSettings {
+                provider: Provider::Openai,
+                account: openai_account_state(status),
+                ..UiSettings::default()
+            };
+            let (menu, actions) = build_tray_menu(&settings, false, None).unwrap();
+            let root = labels(menu.0);
+            assert_eq!(&root[..2], ["OpenAI", detail]);
+            let start = root
+                .iter()
+                .position(|label| label.starts_with("Start recording"))
+                .unwrap();
+            assert_disabled(menu.0, start);
+            assert!(
+                !actions
+                    .values()
+                    .any(|event| *event == UiEvent::ToggleRecord)
+            );
+            assert!(actions.values().any(|event| *event == UiEvent::OpenConfig));
+            assert!(
+                !labels(submenu(menu.0, "Recording"))
+                    .iter()
+                    .any(|item| item == "Realtime transcription")
+            );
+        }
+    }
+
+    #[test]
+    fn elevenlabs_menu_exposes_realtime_setting() {
+        let settings = UiSettings {
+            provider: Provider::Elevenlabs,
+            realtime_enabled: true,
+            ..UiSettings::default()
+        };
+        let (menu, actions) = build_tray_menu(&settings, false, None).unwrap();
+        assert!(
+            labels(submenu(menu.0, "Recording"))
+                .iter()
+                .any(|item| item == "Realtime transcription")
+        );
+        assert!(
+            actions
+                .values()
+                .any(|event| *event == UiEvent::ToggleRealtime)
+        );
+    }
+
+    #[test]
+    fn openai_identity_is_single_line_and_has_no_mnemonics() {
+        let settings = UiSettings {
+            provider: Provider::Openai,
+            account: openai_account_state(SessionStatus::Ready {
+                email: Some(format!("first\0\n\t&{}", "x".repeat(100))),
+                plan: Some("pl&us\nmore".into()),
+            }),
+            ..UiSettings::default()
+        };
+        let (menu, _) = build_tray_menu(&settings, false, None).unwrap();
+        let root = labels(menu.0);
+        assert_eq!(root[0], "OpenAI · Pl&&us more");
+        assert!(root[1].starts_with("first   &&"));
+        assert!(root[1].ends_with('…'));
+        assert!(root[1].encode_utf16().count() <= 73);
+        assert!(!root[1].chars().any(char::is_control));
+    }
 }

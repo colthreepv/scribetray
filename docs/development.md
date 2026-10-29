@@ -5,7 +5,8 @@ contributors. Public setup instructions are in the [README](../README.md).
 
 ## Build and deploy locally
 
-Requirements are Rust 1.85 or newer and the Windows MSVC toolchain. The
+Requirements are Rust 1.98 or newer, the Windows MSVC toolchain, and the
+native tools described below. The
 PowerShell helper builds a locked release executable, stages it outside the
 repository, and switches a stable <code>latest</code> junction to the new
 version:
@@ -51,6 +52,39 @@ default retention count is three. The helper runs
 the executable has been staged.
 
 ## Manual single-user release flow
+
+### Native build tools
+
+The OpenAI HTTP client uses `wreq` with browser-compatible TLS/HTTP settings.
+Its BoringSSL dependency needs MSVC C++ build tools, CMake, NASM and libclang.
+Install these on the build machine; no Python or browser is required at runtime.
+
+`scripts/native-tools.ps1` locates CMake and NASM on `PATH`, then checks
+`%USERPROFILE%\bin\cmake\bin\cmake.exe` and
+`%USERPROFILE%\bin\nasm\nasm.exe`. Set `CMAKE` or
+`CMAKE_ASM_NASM_COMPILER` to override their executable paths. Set `LIBCLANG_PATH`
+to the directory containing `libclang.dll`; the default is
+`%USERPROFILE%\bin\libclang`. These are ordinary tool installations, not files
+inside a checkout or a temporary prototype directory.
+
+Dot-source the helper before direct Cargo commands. The deploy helper loads it
+automatically. `.cargo/config.toml` enables static C/C++ runtime linkage for
+`x86_64-pc-windows-msvc`; inspect the release with `dumpbin /dependents` to
+confirm only Windows system DLLs remain. The compiler and native tools are not
+shipped with the app. `Cargo.lock` records tested dependency versions and builds
+use `--locked`; ordinary dependency requirements allow deliberate upgrades.
+
+There is no hosted build CI yet. A future Windows runner must provision the
+same native tools and run a clean build before claiming CI support.
+
+For an explicit live provider check, prepare a short synthetic recording as
+16 kHz mono signed-16 little-endian PCM, then run
+`cargo run --release --locked --example transcribe-smoke -- openai synthetic.pcm`.
+Use `elevenlabs` instead with `ELEVENLABS_API_KEY` set to check the existing
+provider through the same production dispatcher. This sends audio to the
+selected service; ordinary unit tests never make these calls.
+
+### Candidate and publication
 
 Releases are prepared and tested locally by one user. Commit the complete
 release source locally first, and build each candidate from a commit. Keep
@@ -127,7 +161,8 @@ Versions follow implementation milestones. M0 was a disposable spike; M1 maps
 to <code>v0.1.x</code>, M2 to <code>v0.2.x</code>, and M3 to
 <code>v0.3.x</code>. Recovery and send features map to <code>v0.4.x</code>,
 ElevenLabs usage to <code>v0.5.x</code>, and the usage header to
-<code>v0.6.x</code>. Patch numbers increment for fixes within the current
+<code>v0.6.x</code>. OpenAI provider support starts at <code>v0.7.0</code>.
+Patch numbers increment for fixes within the current
 milestone. The tray tooltip shows the running package version.
 
 ## Caret detection and text insertion

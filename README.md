@@ -4,12 +4,12 @@
 
 <p align="center">
   <b>Press a hotkey, talk, and your words appear where your cursor is.</b><br>
-  A tiny Windows tray app powered by <a href="https://elevenlabs.io/speech-to-text">ElevenLabs Scribe</a>.
+  A tiny Windows tray app using ElevenLabs Scribe or your local Codex ChatGPT session.
 </p>
 
 <p align="center">
   <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white">
-  <img alt="Written in Rust" src="https://img.shields.io/badge/Rust-1.85%2B-B7410E?logo=rust&logoColor=white">
+  <img alt="Written in Rust" src="https://img.shields.io/badge/Rust-1.98%2B-B7410E?logo=rust&logoColor=white">
   <img alt="License: WTFPL" src="https://img.shields.io/badge/license-WTFPL-2EA44F">
 </p>
 
@@ -61,6 +61,33 @@ The tray icon appears faded until Scribetray has a key. Right-click it, choose *
 
 Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
 
+### Use your Codex ChatGPT session instead
+
+1. Sign in to Codex app or Codex CLI with your ChatGPT account on this computer.
+2. Open Scribetray's settings file from the tray menu and add `provider = "openai"`.
+3. Save the file. Scribetray detects the session and shows the account and cached
+   plan in the menu. No ElevenLabs API key is needed for this provider.
+
+Scribetray reads `auth.json` inside `CODEX_HOME` when set, otherwise
+`%USERPROFILE%\.codex\auth.json`. An invalid explicit `CODEX_HOME` reports an
+error instead of selecting a different account. This version supports Codex's
+file-based ChatGPT session; API-key sign-in and OS credential-store-only
+sessions are not supported by this integration.
+
+OpenAI dictation uploads the recording when you stop. The realtime option is
+hidden while OpenAI is selected; its saved ElevenLabs preference is preserved.
+There is no usage meter for OpenAI. The plan label is cached session metadata,
+not a live billing check or a guarantee of access or unlimited transcription.
+
+Scribetray never renews the session or changes Codex's credentials. If it expires,
+open Codex and use or sign in to it so Codex can renew the session, then try
+again. Scribetray rereads the file without requiring a restart.
+
+This experimental integration uses the private ChatGPT dictation endpoint used
+by the desktop app. It may change or become unavailable. It does not use a paid
+OpenAI Platform API key. Audio follows ChatGPT's service and retention rules;
+Scribetray does not delete server-side uploads.
+
 ## Everyday use
 
 | Key | While idle | While recording |
@@ -85,26 +112,31 @@ reaches the focused app and the recording continues. Turn the option off to
 let both Enter combinations reach the app. Use the recording hotkey to stop
 and insert the transcript.
 
-The tray menu also shows cached monthly usage and an estimate of remaining batch transcription time. Set `scribe_credits_per_hour` to tune that estimate; realtime usage is excluded.
+With ElevenLabs selected, the tray menu shows cached monthly usage and an estimate of remaining batch transcription time. Set `scribe_credits_per_hour` to tune that estimate; realtime usage is excluded. With OpenAI selected, it shows the detected account and optional plan instead.
 
 Scribetray listens only while recording. In realtime mode, audio streams to ElevenLabs as you speak; in batch mode, it is uploaded when you stop. Esc is claimed only while a recording is running. Plain Enter is intercepted only when **Intercept Enter while recording** is enabled; Shift+Enter always reaches the focused app.
 
 ## What does it cost?
 
-Scribetray is free and open source. Transcription is billed by ElevenLabs to your account. The free plan's monthly credits are enough to try it out, and after that Scribe costs roughly **$0.22 per hour of audio** on pay-as-you-go. A typical 30-second dictation costs a fraction of a cent. Current prices are on [ElevenLabs' pricing page](https://elevenlabs.io/pricing).
+Scribetray is free and open source. ElevenLabs transcription uses your ElevenLabs account and its current [pricing](https://elevenlabs.io/pricing). The OpenAI provider uses your existing Codex ChatGPT session and the access available to that account. Scribetray cannot report its remaining transcription allowance.
 
 ## Privacy
 
-- Audio is sent to ElevenLabs only when you record, and only for transcription. See ElevenLabs' [privacy policy](https://elevenlabs.io/privacy-policy).
+- Audio is sent to your selected provider when you record. ElevenLabs realtime streams while you speak; both batch providers upload when you stop. See the selected provider's privacy and retention policies.
 - Your last 20 recordings (audio and text) are kept on your PC in `%LOCALAPPDATA%\Scribetray\history`, so that nothing is lost when something fails. Delete that folder any time.
 - Your API key is stored in plain text in `%APPDATA%\Scribetray\config.toml`. A restricted key limits what it can do if it ever leaks.
-- Scribetray talks only to ElevenLabs: transcription requests, plus a monthly usage check if your key allows it.
+- Scribetray sends transcription requests to the selected provider. It checks monthly ElevenLabs usage only while ElevenLabs is selected and your key permits it. A manual retry from history uses the provider currently selected in settings.
+- The OpenAI provider reads your Codex access token locally and sends it to ChatGPT. It does not store another copy or use the refresh token.
 
 ## Settings
 
 Most options are in the tray menu. Everything else lives in `%APPDATA%\Scribetray\config.toml`, which reloads automatically when you save it:
 
+Changes saved during a recording apply after it stops. The recording uses the
+provider selected when it started.
+
 ```toml
+provider = "elevenlabs"    # or "openai": use the local Codex ChatGPT session
 api_key = ""               # or set ELEVENLABS_API_KEY
 hotkey = "Win+Alt+V"       # letters, digits, F1–F24, Space, Tab… with Win/Alt/Ctrl/Shift
 mode = "toggle"            # or "push_to_talk": hold the hotkey while you speak
@@ -119,7 +151,7 @@ restore_clipboard = true
 max_seconds = 600          # a recording stops by itself after 10 minutes
 scribe_credits_per_hour = 585 # estimated batch Scribe credits per recording hour
 microphone = ""            # blank uses the Windows default input device
-realtime = false           # stream audio while you talk (costs more)
+realtime = false           # ElevenLabs only; preserved while OpenAI is selected
 keyterms = []              # words Scribe should expect, e.g. ["Scribetray", "Kubernetes"]
 sound_cues = true
 start_with_windows = false
@@ -134,11 +166,15 @@ start_with_windows = false
 
 ## Build from source
 
-You need Rust 1.85+ with the MSVC toolchain.
+You need Rust 1.98+ with the MSVC toolchain, CMake, NASM and libclang.
+The native tools compile the OpenAI client's TLS library. They are build-time
+requirements; users downloading the EXE do not need to install them. See
+[native tool setup](docs/development.md#native-build-tools) before building.
 
 ```powershell
 git clone https://github.com/colthreepv/scribetray
 cd scribetray
+. .\scripts\native-tools.ps1
 cargo build --release --locked
 .\target\release\scribetray.exe
 ```
@@ -147,4 +183,4 @@ To run your own builds day to day, `scripts/deploy-latest.ps1` builds, keeps a f
 
 ## License
 
-Scribetray is distributed under the [Do What The Fuck You Want To Public License, Version 2 (WTFPL)](LICENSE). It is an independent project and is not affiliated with or endorsed by ElevenLabs.
+Scribetray is distributed under the [Do What The Fuck You Want To Public License, Version 2 (WTFPL)](LICENSE). It is an independent project and is not affiliated with or endorsed by ElevenLabs or OpenAI.
