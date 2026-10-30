@@ -52,8 +52,10 @@ const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
 /// How long a transcript waits for the user to return to the original field.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(150);
-/// Quiet time after the original field regains focus before inserting.
-const PENDING_SETTLE: Duration = Duration::from_millis(400);
+/// Time the original field must keep focus before a pending transcript is inserted.
+const PENDING_SETTLE: Duration = Duration::from_millis(50);
+/// Main loop wake-up interval while a transcript is pending.
+const PENDING_TICK: Duration = Duration::from_millis(25);
 const CUE_SAMPLE_RATE: u32 = 22_050;
 const SUBSCRIPTION_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -69,7 +71,6 @@ struct PendingDelivery {
     history_id: String,
     deadline: Instant,
     settle_since: Option<Instant>,
-    last_input: Option<u32>,
 }
 
 thread_local! {
@@ -298,7 +299,12 @@ fn run() -> Result<(), String> {
 
     info!("Scribetray started");
     loop {
-        let event = ui.events.recv_timeout(TICK);
+        let tick = if PENDING.with_borrow(Option::is_some) {
+            PENDING_TICK
+        } else {
+            TICK
+        };
+        let event = ui.events.recv_timeout(tick);
         if active.is_none()
             && let Some(updated) = config_monitor.load_if_changed(&config)
         {
@@ -1152,7 +1158,6 @@ fn complete_transcription(
                             history_id: history_id.to_owned(),
                             deadline: Instant::now() + PENDING_TIMEOUT,
                             settle_since: None,
-                            last_input: None,
                         }));
                         let _ = ui.send(UiCommand::SetTrayError(false));
                         if !recording_active {
@@ -1217,8 +1222,8 @@ fn complete_transcription(
     }
 }
 
-/// Inserts a pending transcript once its original field is focused again and
-/// keyboard and mouse have been quiet for `PENDING_SETTLE`.
+/// Inserts a pending transcript once its original field has been focused
+/// again for `PENDING_SETTLE`.
 fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &History) {
     let ready = PENDING.with_borrow_mut(|slot| {
         let pending = slot.as_mut()?;
@@ -1232,18 +1237,9 @@ fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &History) {
             pending.settle_since = None;
             return None;
         }
-        let input = wininput::last_input_tick();
-        match pending.settle_since {
-            Some(since) if input == pending.last_input => {
-                if since.elapsed() < PENDING_SETTLE {
-                    return None;
-                }
-            }
-            _ => {
-                pending.settle_since = Some(now);
-                pending.last_input = input;
-                return None;
-            }
+        let since = *pending.settle_since.get_or_insert(now);
+        if since.elapsed() < PENDING_SETTLE {
+            return None;
         }
         slot.take()
     });
@@ -1632,7 +1628,7 @@ fn play_cue(enabled: bool, cue: u32) {
         [
             make_cue_wave(&[660, 880], 65, 18),
             make_cue_wave(&[330], 150, 0),
-            make_cue_wave(&[880, 660], 55, 14),
+            make_cue_wave(&[523, 523], 90, 70),
         ]
     });
     let wave = match cue {
