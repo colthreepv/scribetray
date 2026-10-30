@@ -90,7 +90,7 @@ Change the recording hotkey from the tray menu. `hotkey` and `cancel_hotkey` can
 
 Turn off **Intercept Enter while recording** in the menu if you want Enter to reach the app while you dictate. The cancel shortcut and Enter are claimed only while a recording is running.
 
-If you switched to another window before the text was ready, it goes to the clipboard instead of the wrong app. Every dictation starts with 🎙️ by default, so readers know it was spoken; turn the prefix off in the menu.
+If the field lost focus before the text was ready, Scribetray copies the text to the clipboard and waits: click back into the same field and it is typed in after a moment. After 2.5 minutes, or when you start a new recording, it stays only on the clipboard. Every dictation starts with 🎙️ by default, so readers know it was spoken; turn the prefix off in the menu.
 
 With ElevenLabs, the menu also shows your monthly credit usage and an estimate of the batch transcription time left. With OpenAI, it shows the signed-in account.
 

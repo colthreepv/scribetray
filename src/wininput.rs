@@ -199,6 +199,26 @@ pub fn copy_text(text: &str) -> Result<()> {
     set_clipboard_text(owner.hwnd, text)
 }
 
+/// Returns true while the captured window and focused element are active again.
+pub fn target_is_current(target: &TargetSnapshot) -> bool {
+    match ComApartment::initialize() {
+        Ok(_com) => target_is_current_inner(target),
+        Err(_) => false,
+    }
+}
+
+/// Tick count of the last keyboard or mouse input in this session. Callers
+/// compare successive values to detect input without reading the clock.
+pub fn last_input_tick() -> Option<u32> {
+    let mut info = windows::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO {
+        cbSize: size_of::<windows::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetLastInputInfo(&mut info) }
+        .as_bool()
+        .then_some(info.dwTime)
+}
+
 /// Synthesize Enter. This module emits Enter nowhere else.
 pub fn send_enter(target: &TargetSnapshot) -> Result<()> {
     wait_for_hotkey_release()?;

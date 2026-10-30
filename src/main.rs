@@ -50,11 +50,32 @@ const APP_DIRECTORY: &str = "Scribetray";
 const TICK: Duration = Duration::from_millis(200);
 const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
+/// How long a transcript waits for the user to return to the original field.
+const PENDING_TIMEOUT: Duration = Duration::from_secs(150);
+/// Quiet time after the original field regains focus before inserting.
+const PENDING_SETTLE: Duration = Duration::from_millis(400);
 const CUE_SAMPLE_RATE: u32 = 22_050;
 const SUBSCRIPTION_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-static SOUND_WAVES: OnceLock<[Vec<u8>; 2]> = OnceLock::new();
+static SOUND_WAVES: OnceLock<[Vec<u8>; 3]> = OnceLock::new();
+
+/// A transcript whose target lost focus before it was ready. It is already on
+/// the clipboard and is inserted when the original field is focused again.
+struct PendingDelivery {
+    target: TargetSnapshot,
+    text: String,
+    enter_after: bool,
+    history_id: String,
+    deadline: Instant,
+    settle_since: Option<Instant>,
+    last_input: Option<u32>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Option<PendingDelivery>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug)]
 struct WorkerFinished {
@@ -345,6 +366,7 @@ fn run() -> Result<(), String> {
             &mut done_until,
         );
         update_timers(&ui, active.as_mut(), &mut done_until);
+        poll_pending_delivery(&config, &ui, &history);
         if config.provider == Provider::Openai
             && account_refresh.elapsed() >= ACCOUNT_REFRESH_INTERVAL
         {
@@ -691,6 +713,9 @@ fn start_recording(
     if !account.ready {
         show_notice(ui, "Scribetray setup", account.unavailable_reason);
         return;
+    }
+    if PENDING.take().is_some() {
+        info!("new recording replaces the pending transcript; it stays on the clipboard");
     }
     let target = match wininput::capture_target() {
         Ok(target) => target,
@@ -1114,6 +1139,29 @@ fn complete_transcription(
                     play_cue(config.sound_cues, 0x40);
                 }
                 Err(error) => {
+                    if matches!(error, wininput::WinInputError::TargetChanged) {
+                        mark_history_delivery(history, history_id, false);
+                        if let Err(copy_error) = wininput::copy_text(&text) {
+                            warn!("could not copy pending transcript: {copy_error}");
+                        }
+                        info!("focus moved; transcript copied and waiting for the original field");
+                        PENDING.set(Some(PendingDelivery {
+                            target,
+                            text,
+                            enter_after: enter_after || config.auto_enter,
+                            history_id: history_id.to_owned(),
+                            deadline: Instant::now() + PENDING_TIMEOUT,
+                            settle_since: None,
+                            last_input: None,
+                        }));
+                        let _ = ui.send(UiCommand::SetTrayError(false));
+                        if !recording_active {
+                            let _ = ui.hide_caret_anchor();
+                            *done_until = None;
+                        }
+                        play_cue(config.sound_cues, 0x20);
+                        return;
+                    }
                     mark_history_delivery(history, history_id, false);
                     let _ = ui.send(UiCommand::SetTrayError(true));
                     match wininput::copy_text(&text) {
@@ -1165,6 +1213,75 @@ fn complete_transcription(
                 *done_until = None;
             }
             play_cue(config.sound_cues, 0x40);
+        }
+    }
+}
+
+/// Inserts a pending transcript once its original field is focused again and
+/// keyboard and mouse have been quiet for `PENDING_SETTLE`.
+fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &History) {
+    let ready = PENDING.with_borrow_mut(|slot| {
+        let pending = slot.as_mut()?;
+        let now = Instant::now();
+        if now >= pending.deadline {
+            info!("pending transcript expired; it stays on the clipboard");
+            *slot = None;
+            return None;
+        }
+        if !wininput::target_is_current(&pending.target) {
+            pending.settle_since = None;
+            return None;
+        }
+        let input = wininput::last_input_tick();
+        match pending.settle_since {
+            Some(since) if input == pending.last_input => {
+                if since.elapsed() < PENDING_SETTLE {
+                    return None;
+                }
+            }
+            _ => {
+                pending.settle_since = Some(now);
+                pending.last_input = input;
+                return None;
+            }
+        }
+        slot.take()
+    });
+    let Some(pending) = ready else {
+        return;
+    };
+
+    let method = if config.insert_method.eq_ignore_ascii_case("type") {
+        InsertMethod::UnicodeTyping
+    } else {
+        InsertMethod::Paste
+    };
+    match wininput::insert_text(&pending.target, &pending.text, method, config.restore_clipboard) {
+        Ok(()) => {
+            mark_history_delivery(history, &pending.history_id, true);
+            if pending.enter_after {
+                thread::sleep(Duration::from_millis(80));
+                if let Err(error) = wininput::send_enter(&pending.target) {
+                    warn!("auto-enter failed after pending insertion: {error}");
+                }
+            }
+            info!("pending transcript inserted after focus returned; method={method:?}");
+            play_cue(config.sound_cues, 0x40);
+        }
+        Err(wininput::WinInputError::TargetChanged) => {
+            PENDING.set(Some(PendingDelivery {
+                settle_since: None,
+                ..pending
+            }));
+        }
+        Err(error) => {
+            warn!("pending transcript was not inserted: {error}");
+            show_notice(
+                ui,
+                "Scribetray",
+                &format!("Text was not inserted ({error}); it is still on the clipboard."),
+            );
+            play_cue(config.sound_cues, 0x10);
         }
     }
 }
@@ -1515,9 +1632,14 @@ fn play_cue(enabled: bool, cue: u32) {
         [
             make_cue_wave(&[660, 880], 65, 18),
             make_cue_wave(&[330], 150, 0),
+            make_cue_wave(&[880, 660], 55, 14),
         ]
     });
-    let wave = if cue == 0x10 { &waves[1] } else { &waves[0] };
+    let wave = match cue {
+        0x10 => &waves[1],
+        0x20 => &waves[2],
+        _ => &waves[0],
+    };
     let played = unsafe {
         PlaySoundW(
             PCWSTR::from_raw(wave.as_ptr().cast()),
