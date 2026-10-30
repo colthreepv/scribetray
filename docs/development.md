@@ -67,8 +67,22 @@ to the directory containing `libclang.dll`; the default is
 `%USERPROFILE%\bin\libclang`. These are ordinary tool installations, not files
 inside a checkout or a temporary prototype directory.
 
-Dot-source the helper before direct Cargo commands. The deploy helper loads it
-automatically. `.cargo/config.toml` enables static C/C++ runtime linkage for
+For everyday work, put the same paths in the per-user Cargo config
+(`%USERPROFILE%\.cargo\config.toml`). Cargo then passes them to every build
+script, so plain `cargo build`, `cargo test` and rust-analyzer work without the
+helper:
+
+```toml
+[env]
+LIBCLANG_PATH = 'C:\Users\<you>\bin\libclang'
+CMAKE = 'C:\Users\<you>\bin\cmake\bin\cmake.exe'
+CMAKE_ASM_NASM_COMPILER = 'C:\Users\<you>\bin\nasm\nasm.exe'
+# CMake looks for NASM through ASM_NASM when nasm.exe is not on PATH.
+ASM_NASM = 'C:\Users\<you>\bin\nasm\nasm.exe'
+```
+
+Without that config, dot-source the helper before direct Cargo commands. The
+deploy helper loads it automatically. `.cargo/config.toml` enables static C/C++ runtime linkage for
 `x86_64-pc-windows-msvc`; inspect the release with `dumpbin /dependents` to
 confirm only Windows system DLLs remain. The compiler and native tools are not
 shipped with the app. `Cargo.lock` records tested dependency versions and builds
