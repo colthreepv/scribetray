@@ -8,6 +8,8 @@ mod config;
 mod openai;
 #[path = "../src/scribe.rs"]
 mod scribe;
+#[path = "../src/silence.rs"]
+mod silence;
 #[path = "../src/transcription.rs"]
 mod transcription;
 

@@ -133,6 +133,7 @@ pub struct HistoryMenuItem {
 #[derive(Clone, Debug)]
 pub struct UiSettings {
     pub toggle_hotkey: Hotkey,
+    pub cancel_hotkey: Hotkey,
     pub push_to_talk: bool,
     pub max_seconds: u32,
     pub realtime_enabled: bool,
@@ -157,6 +158,11 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             toggle_hotkey: Hotkey::default(),
+            cancel_hotkey: Hotkey::with_modifiers(
+                0x1B,
+                "Esc",
+                HotkeyModifiers::with_all_modifiers(false, false, false, false),
+            ),
             push_to_talk: false,
             max_seconds: 600,
             realtime_enabled: false,
@@ -244,7 +250,7 @@ pub enum UiEvent {
         hotkey: Hotkey,
         error: String,
     },
-    EscapeRegistrationFailed {
+    CancelRegistrationFailed {
         error: String,
     },
     PushToTalkHookFailed {
@@ -255,7 +261,7 @@ pub enum UiEvent {
 /// Commands sent to the native UI thread by the parent application.
 #[derive(Clone, Debug)]
 pub enum UiCommand {
-    SetSettings(UiSettings),
+    SetSettings(Box<UiSettings>),
     SetUsage(Option<UsageSnapshot>),
     UpdateHistory(Vec<HistoryMenuItem>),
     SetRecording(bool),

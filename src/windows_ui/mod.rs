@@ -60,7 +60,7 @@ const TRAY_CALLBACK: u32 = WM_APP + 1;
 const WAKE_COMMANDS: u32 = WM_APP + 2;
 const RELEASE_ENTER_HOOK: u32 = WM_APP + 3;
 const HOTKEY_TOGGLE_ID: i32 = 0x5343;
-const HOTKEY_ESCAPE_ID: i32 = 0x5345;
+const HOTKEY_CANCEL_ID: i32 = 0x5345;
 /// Ticks the tray tooltip once per second while recording.
 const TIMER_RECORDING: usize = 0x5343;
 /// Advances the caret overlay animation while it is visible.
@@ -258,7 +258,7 @@ fn create_ui_state(
         overlay_shown_at: Instant::now(),
         overlay_state_since: Instant::now(),
         toggle_registered: false,
-        escape_registered: false,
+        cancel_registered: false,
         recording: false,
         shutting_down: false,
         anchor_rect: None,
@@ -429,8 +429,8 @@ unsafe extern "system" fn window_proc(
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE_ID => state.handle_user_event(UiEvent::ToggleRecord),
-                    HOTKEY_ESCAPE_ID => {
-                        state.unregister_escape();
+                    HOTKEY_CANCEL_ID => {
+                        state.unregister_cancel();
                         state.recording = false;
                         KEYBOARD_HOOK_STATE.with(|hook_state| {
                             if let Some(hook_state) = hook_state.borrow_mut().as_mut() {

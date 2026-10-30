@@ -39,7 +39,7 @@ pub(super) struct UiState {
     pub(super) tray_theme: TrayTheme,
     pub(super) tray_tooltip: String,
     pub(super) toggle_registered: bool,
-    pub(super) escape_registered: bool,
+    pub(super) cancel_registered: bool,
     pub(super) recording: bool,
     pub(super) shutting_down: bool,
     pub(super) anchor_rect: Option<CaretRect>,
@@ -66,11 +66,15 @@ impl UiState {
         match command {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
+                let cancel_changed = self.settings.cancel_hotkey != settings.cancel_hotkey;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
                 if settings.provider != crate::config::Provider::Elevenlabs {
                     self.usage = None;
                 }
-                self.settings = settings;
+                if cancel_changed && self.recording {
+                    self.unregister_cancel();
+                }
+                self.settings = *settings;
                 KEYBOARD_HOOK_STATE.with(|state| {
                     if let Some(state) = state.borrow_mut().as_mut() {
                         if hotkeys_changed || mode_changed {
@@ -85,6 +89,10 @@ impl UiState {
                 });
                 if hotkeys_changed || mode_changed {
                     self.register_hotkeys();
+                }
+                if cancel_changed && self.recording {
+                    self.recording = false;
+                    self.set_recording(true);
                 }
                 self.update_keyboard_hook();
                 self.refresh_tray();
@@ -253,7 +261,7 @@ impl UiState {
 
     pub(super) fn cleanup(&mut self) {
         self.remove_keyboard_hook();
-        self.unregister_escape();
+        self.unregister_cancel();
         self.unregister_record_hotkeys();
         self.level_meter = None;
         self.overlay_visible = false;

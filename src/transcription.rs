@@ -70,6 +70,20 @@ pub fn transcribe(
     pcm: &[u8],
     language: Option<&str>,
 ) -> Result<Transcription, String> {
+    let trimmed = if config.trim_silence {
+        crate::silence::trim_silence(pcm).map(|(audio, stats)| {
+            tracing::info!(
+                original_ms = stats.original_ms,
+                trimmed_ms = stats.trimmed_ms,
+                pauses_shortened = stats.pauses_shortened,
+                "shortened silence for batch upload"
+            );
+            audio
+        })
+    } else {
+        None
+    };
+    let pcm = trimmed.as_deref().unwrap_or(pcm);
     match config.provider {
         Provider::Elevenlabs => {
             let key = config

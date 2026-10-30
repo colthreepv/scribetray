@@ -30,10 +30,14 @@ api_key = ""
 
 # Global recording shortcut. Supported modifiers: Win, Alt, Ctrl, Shift.
 hotkey = "Win+Alt+V"
+# Shortcut to cancel an active recording.
+cancel_hotkey = "Esc"
 # Recording mode: "toggle" or "push_to_talk".
 mode = "toggle"
 # Stream audio while recording. Realtime transcription costs more than batch.
 realtime = false
+# Shorten silence in batch uploads.
+trim_silence = true
 # Optional vocabulary hints sent to Scribe; an empty list is the default.
 keyterms = []
 # Speech-to-text model and language detection preference.
@@ -70,10 +74,14 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Main global recording hotkey.
     pub hotkey: String,
+    /// Global shortcut to cancel an active recording.
+    pub cancel_hotkey: String,
     /// Recording interaction mode (for example, `toggle` or `push_to_talk`).
     pub mode: String,
     /// Stream audio to Scribe as it is recorded instead of using batch transcription.
     pub realtime: bool,
+    /// Shorten silence before batch transcription.
+    pub trim_silence: bool,
     /// Optional vocabulary hints for Scribe; non-empty lists incur ElevenLabs' keyterm premium.
     pub keyterms: Vec<String>,
     /// ElevenLabs speech-to-text model identifier.
@@ -106,8 +114,10 @@ impl fmt::Debug for Config {
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("hotkey", &self.hotkey)
+            .field("cancel_hotkey", &self.cancel_hotkey)
             .field("mode", &self.mode)
             .field("realtime", &self.realtime)
+            .field("trim_silence", &self.trim_silence)
             .field("keyterms", &self.keyterms)
             .field("model", &self.model)
             .field("language", &self.language)
@@ -132,8 +142,10 @@ impl Default for Config {
             provider: Provider::Elevenlabs,
             api_key: None,
             hotkey: "Win+Alt+V".to_owned(),
+            cancel_hotkey: "Esc".to_owned(),
             mode: "toggle".to_owned(),
             realtime: false,
+            trim_silence: true,
             keyterms: Vec::new(),
             model: DEFAULT_MODEL.to_owned(),
             language: DEFAULT_LANGUAGE_CODE.to_owned(),
@@ -269,6 +281,8 @@ mod provider_tests {
     fn missing_provider_defaults_to_elevenlabs_and_roundtrips() {
         let old: Config = toml::from_str("realtime = true\n").unwrap();
         assert_eq!(old.provider, Provider::Elevenlabs);
+        assert_eq!(old.cancel_hotkey, "Esc");
+        assert!(old.trim_silence);
         let openai: Config = toml::from_str("provider = 'openai'\nrealtime = true\n").unwrap();
         assert_eq!(openai.provider, Provider::Openai);
         assert!(openai.realtime);

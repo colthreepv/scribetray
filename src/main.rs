@@ -11,6 +11,7 @@ mod hotkey_dialog;
 mod openai;
 mod realtime;
 mod scribe;
+mod silence;
 mod subscription;
 mod transcription;
 mod windows_ui;
@@ -285,7 +286,7 @@ fn run() -> Result<(), String> {
             let microphones = ui_settings.microphones.clone();
             ui_settings =
                 make_ui_settings(&config, history.list().unwrap_or_default(), microphones);
-            if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
+            if let Err(error) = ui.send(UiCommand::SetSettings(Box::new(ui_settings.clone()))) {
                 warn!("could not apply reloaded settings: {error}");
             }
         }
@@ -351,7 +352,7 @@ fn run() -> Result<(), String> {
             let account = transcription::account_state(&config);
             if account != ui_settings.account {
                 ui_settings.account = account;
-                let _ = ui.send(UiCommand::SetSettings(ui_settings.clone()));
+                let _ = ui.send(UiCommand::SetSettings(Box::new(ui_settings.clone())));
             }
         }
     }
@@ -464,9 +465,21 @@ fn handle_ui_event(
         UiEvent::CaptureToggleHotkey => {
             match hotkey_dialog::capture_hotkey(ui.native_window_handle()) {
                 Ok(Some(hotkey)) => match parse_hotkey(&hotkey) {
-                    Ok(_) => {
-                        config.hotkey = hotkey;
-                        save_config(config, ui);
+                    Ok(parsed) => {
+                        let cancel = parse_cancel_hotkey(&config.cancel_hotkey)
+                            .expect("validated cancel hotkey");
+                        if parsed.virtual_key == cancel.virtual_key
+                            && parsed.modifiers == cancel.modifiers
+                        {
+                            show_notice(
+                                ui,
+                                "Scribetray hotkey",
+                                "Recording and cancel hotkeys must differ.",
+                            );
+                        } else {
+                            config.hotkey = hotkey;
+                            save_config(config, ui);
+                        }
                     }
                     Err(error) => show_notice(ui, "Scribetray hotkey", &error),
                 },
@@ -575,7 +588,7 @@ fn handle_ui_event(
             }
         }
         UiEvent::HotkeyRegistrationFailed { error, .. } => warn!("{error}"),
-        UiEvent::EscapeRegistrationFailed { error } => warn!("Escape hotkey unavailable: {error}"),
+        UiEvent::CancelRegistrationFailed { error } => warn!("{error}"),
         UiEvent::PushToTalkHookFailed { error } => {
             warn!("{error}");
             config.mode = "toggle".to_owned();
@@ -585,7 +598,7 @@ fn handle_ui_event(
 
     let microphones = ui_settings.microphones.clone();
     *ui_settings = make_ui_settings(config, history.list().unwrap_or_default(), microphones);
-    if let Err(error) = ui.send(UiCommand::SetSettings(ui_settings.clone())) {
+    if let Err(error) = ui.send(UiCommand::SetSettings(Box::new(ui_settings.clone()))) {
         warn!("could not refresh tray settings: {error}");
     }
     true
@@ -1208,6 +1221,8 @@ fn make_ui_settings(
     microphones: Vec<String>,
 ) -> UiSettings {
     let toggle_hotkey = parse_hotkey(&config.hotkey).unwrap_or_default();
+    let cancel_hotkey =
+        parse_cancel_hotkey(&config.cancel_hotkey).expect("validated cancel hotkey");
     let languages = [
         ("auto", "Automatic detection"),
         ("en", "English"),
@@ -1242,6 +1257,7 @@ fn make_ui_settings(
         .collect();
     UiSettings {
         toggle_hotkey,
+        cancel_hotkey,
         push_to_talk: config.mode.eq_ignore_ascii_case("push_to_talk"),
         max_seconds: config.max_seconds,
         realtime_enabled: config.realtime,
@@ -1272,7 +1288,11 @@ fn config_stamp() -> Option<ConfigStamp> {
 }
 
 fn validate_config(config: &Config) -> Result<(), String> {
-    parse_hotkey(&config.hotkey)?;
+    let hotkey = parse_hotkey(&config.hotkey)?;
+    let cancel = parse_cancel_hotkey(&config.cancel_hotkey)?;
+    if hotkey.virtual_key == cancel.virtual_key && hotkey.modifiers == cancel.modifiers {
+        return Err("cancel_hotkey must differ from hotkey".to_owned());
+    }
     if config.max_seconds == 0 {
         return Err("max_seconds must be greater than zero".to_owned());
     }
@@ -1342,6 +1362,14 @@ fn mark_history_delivery(history: &History, history_id: &str, delivered: bool) {
 }
 
 fn parse_hotkey(value: &str) -> Result<Hotkey, String> {
+    parse_hotkey_inner(value, false)
+}
+
+fn parse_cancel_hotkey(value: &str) -> Result<Hotkey, String> {
+    parse_hotkey_inner(value, true)
+}
+
+fn parse_hotkey_inner(value: &str, allow_unmodified_escape: bool) -> Result<Hotkey, String> {
     let mut win = false;
     let mut alt = false;
     let mut shift = false;
@@ -1371,7 +1399,9 @@ fn parse_hotkey(value: &str) -> Result<Hotkey, String> {
             })?);
         }
     }
-    if !(win || alt || shift || control) {
+    if !(win || alt || shift || control)
+        && !(allow_unmodified_escape && key.as_ref().is_some_and(|(key, _)| *key == 0x1B))
+    {
         return Err(format!("Hotkey {value:?} needs at least one modifier."));
     }
     let (virtual_key, label) = key.ok_or_else(|| format!("Hotkey {value:?} has no key."))?;
@@ -1565,6 +1595,20 @@ unsafe extern "system" {
 #[cfg(test)]
 mod provider_validation_tests {
     use super::*;
+
+    #[test]
+    fn cancel_hotkey_validation_handles_defaults_aliases_and_conflicts() {
+        let mut config = Config::default();
+        assert!(validate_config(&config).is_ok());
+        assert_eq!(parse_cancel_hotkey("escape").unwrap().virtual_key, 0x1b);
+        assert!(parse_hotkey("Esc").is_err());
+        config.cancel_hotkey = "Alt+Windows+v".into();
+        assert!(validate_config(&config).is_err());
+        config.cancel_hotkey = "Win+Alt+X".into();
+        assert!(validate_config(&config).is_ok());
+        config.cancel_hotkey = "bad key".into();
+        assert!(validate_config(&config).is_err());
+    }
 
     #[test]
     fn elevenlabs_options_are_ignored_by_openai_validation() {

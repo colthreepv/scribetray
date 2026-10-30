@@ -1,13 +1,12 @@
 use super::state::UiState;
 use super::types::{Hotkey, UiEvent};
-use super::{HOTKEY_ESCAPE_ID, HOTKEY_TOGGLE_ID, HotkeyPurpose, RELEASE_ENTER_HOOK, TITLE};
+use super::{HOTKEY_CANCEL_ID, HOTKEY_TOGGLE_ID, HotkeyPurpose, RELEASE_ENTER_HOOK, TITLE};
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE, VK_RETURN,
-    VK_SHIFT,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KBDLLHOOKSTRUCT, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
@@ -87,38 +86,40 @@ impl UiState {
             }
         });
         if recording {
+            let hotkey = &self.settings.cancel_hotkey;
             match unsafe {
                 RegisterHotKey(
                     Some(self.tray_hwnd),
-                    HOTKEY_ESCAPE_ID,
-                    MOD_NOREPEAT,
-                    VK_ESCAPE.0 as u32,
+                    HOTKEY_CANCEL_ID,
+                    hotkey.win32_modifiers(),
+                    hotkey.virtual_key,
                 )
             } {
                 Ok(()) => {
-                    self.escape_registered = true;
-                    info!("registered Escape recording cancel hotkey");
+                    self.cancel_registered = true;
+                    info!("registered {} cancel hotkey", hotkey.combo_label());
                 }
                 Err(error) => {
                     let message = format!(
-                        "Could not register Escape to cancel recording: {error}. Use the tray menu to stop recording."
+                        "Could not register cancel hotkey {}: {error}. Use the tray menu to stop recording.",
+                        hotkey.combo_label()
                     );
-                    let _ = self.events.send(UiEvent::EscapeRegistrationFailed {
-                        error: error.to_string(),
+                    let _ = self.events.send(UiEvent::CancelRegistrationFailed {
+                        error: message.clone(),
                     });
                     self.show_notice(TITLE, &message);
                 }
             }
         } else {
-            self.unregister_escape();
+            self.unregister_cancel();
         }
         self.update_keyboard_hook();
     }
 
-    pub(super) fn unregister_escape(&mut self) {
-        if self.escape_registered {
-            let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_ESCAPE_ID) };
-            self.escape_registered = false;
+    pub(super) fn unregister_cancel(&mut self) {
+        if self.cancel_registered {
+            let _ = unsafe { UnregisterHotKey(Some(self.tray_hwnd), HOTKEY_CANCEL_ID) };
+            self.cancel_registered = false;
         }
     }
 
