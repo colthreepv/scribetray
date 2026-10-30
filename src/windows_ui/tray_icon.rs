@@ -113,7 +113,7 @@ pub(super) fn tray_tooltip_text(
     elapsed: Option<Duration>,
     off_reason: &str,
 ) -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = display_version();
     match state {
         TrayState::Idle => format!(
             "Scribetray {version} — Ready ({}) · click: copy last dictation",
@@ -148,3 +148,19 @@ pub(super) fn tray_off_reason(settings: &UiSettings, toggle_registered: bool) ->
         ""
     }
 }
+
+/// Version shown in the tray. Local candidate builds carry a `build.json`
+/// beside the executable whose `candidateLabel` (for example
+/// `0.8.1-test.3`) is shown instead; published downloads have no such file.
+pub(super) fn display_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::read(exe.with_file_name("build.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|build| build.get("candidateLabel")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+    })
+}
+
