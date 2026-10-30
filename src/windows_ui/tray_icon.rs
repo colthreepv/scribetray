@@ -109,6 +109,7 @@ pub(super) fn setting_change_is_immersive_color(lparam: LPARAM) -> bool {
 pub(super) fn tray_tooltip_text(
     state: TrayState,
     hotkey: &Hotkey,
+    cancel_hotkey: &Hotkey,
     elapsed: Option<Duration>,
     off_reason: &str,
 ) -> String {
@@ -121,9 +122,10 @@ pub(super) fn tray_tooltip_text(
         TrayState::Recording => {
             let total = elapsed.unwrap_or_default().as_secs();
             format!(
-                "Scribetray {version} — Recording {:02}:{:02} · Enter to send · Esc to cancel",
+                "Scribetray {version} — Recording {:02}:{:02} · Enter to send · {} to cancel",
                 (total / 60) % 100,
-                total % 60
+                total % 60,
+                cancel_hotkey.combo_label()
             )
         }
         TrayState::Working => format!("Scribetray {version} — Transcribing…"),

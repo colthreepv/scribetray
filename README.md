@@ -15,8 +15,6 @@
 
 ---
 
-Typing a long prompt to an AI agent, answering a chat, writing a commit message: most of what we type we could just *say*. Scribetray lets you do that in any app, without switching windows or copying anything.
-
 1. Put your cursor in a text field.
 2. Press **Win+Alt+V** and speak. A small waveform floats next to your cursor so you know it's listening.
 3. Press **Win+Alt+V** again. A moment later the text is typed in, right where you left it.
@@ -27,15 +25,7 @@ Press **Enter** instead to insert the text *and send it*, which is handy in chat
   <img src="docs/media/overlay-recording.gif" alt="The recording overlay: a small pill with a live waveform" width="330">
 </p>
 
-## Why Scribetray
-
-- **Works everywhere you type.** Browsers, Electron apps, editors, chat clients. Scribetray types the text as keystrokes into the field that had focus when you started, so it doesn't depend on per-app integrations.
-- **Your clipboard stays yours.** Text is typed, not pasted. A paste mode exists for the rare field that prefers it, and it restores your clipboard afterwards.
-- **Nothing gets lost.** If you switched windows while it was transcribing, the text goes to the clipboard instead of into the wrong app. The last recordings stay on disk, so a failed upload can be retried and **one click on the tray icon** copies your last dictation.
-- **Honest about what it did.** By default every dictation starts with 🎙️, so whoever reads it (a colleague, or an AI agent) knows it was spoken and may contain a transcription slip. You can turn this off in the menu.
-- **Two ways to transcribe.** Use ElevenLabs Scribe with an API key, or your ChatGPT subscription through a local Codex login. Choose the provider in settings.
-- **Automatic or pinned language.** Both providers can detect the language, or you can pin one from the tray menu.
-- **Small and quiet.** A single native executable. No installer, no admin rights, no background service, no telemetry.
+It works in any app you can type into, and ships as a single executable: no installer, no admin rights, no telemetry.
 
 ## Get started
 
@@ -99,6 +89,8 @@ Change the recording hotkey from the tray menu. `hotkey` and `cancel_hotkey` can
 - **Right-click** for the menu. From there you can choose the microphone and language, browse recent dictations, switch to push-to-talk, and change the recording hotkey.
 
 Turn off **Intercept Enter while recording** in the menu if you want Enter to reach the app while you dictate. The cancel shortcut and Enter are claimed only while a recording is running.
+
+If you switched to another window before the text was ready, it goes to the clipboard instead of the wrong app. Every dictation starts with 🎙️ by default, so readers know it was spoken; turn the prefix off in the menu.
 
 With ElevenLabs, the menu also shows your monthly credit usage and an estimate of the batch transcription time left. With OpenAI, it shows the signed-in account.
 

@@ -598,6 +598,12 @@ fn build_tray_menu(
         &mut actions,
     )?;
     append_separator(root.0)?;
+    append_flags(
+        root.0,
+        MF_GRAYED,
+        0,
+        concat!("Scribetray ", env!("CARGO_PKG_VERSION")),
+    )?;
     append_action(root.0, "Quit Scribetray", 19, UiEvent::Quit, &mut actions)?;
 
     let _ = unsafe {

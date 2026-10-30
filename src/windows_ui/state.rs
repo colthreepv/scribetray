@@ -182,6 +182,7 @@ impl UiState {
         let tooltip = tray_tooltip_text(
             state,
             &self.settings.toggle_hotkey,
+            &self.settings.cancel_hotkey,
             self.recording_started.map(|started| started.elapsed()),
             tray_off_reason(&self.settings, self.toggle_registered),
         );

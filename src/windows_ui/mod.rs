@@ -230,6 +230,7 @@ fn create_ui_state(
     let initial_tooltip = tray_tooltip_text(
         initial_state,
         &settings.toggle_hotkey,
+        &settings.cancel_hotkey,
         None,
         tray_off_reason(&settings, false),
     );
