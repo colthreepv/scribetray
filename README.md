@@ -130,6 +130,7 @@ realtime = false           # ElevenLabs only; kept but ignored with OpenAI
 trim_silence = true        # shorten long pauses before batch upload
 keyterms = []              # words Scribe should expect, e.g. ["Scribetray", "Kubernetes"]
 sound_cues = true
+pending_sound = true       # two beeps when the text waits for you to return to the field
 start_with_windows = false
 ```
 

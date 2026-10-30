@@ -60,6 +60,9 @@ scribe_credits_per_hour = 585
 # Leave blank to use the Windows default microphone.
 microphone = ""
 sound_cues = true
+# Two beeps when focus moved and the text waits for you to return to the field.
+# Independent of sound_cues.
+pending_sound = true
 start_with_windows = false
 "#;
 
@@ -104,6 +107,8 @@ pub struct Config {
     /// Selected input device name, or `None` for the system default.
     pub microphone: Option<String>,
     pub sound_cues: bool,
+    /// Play the pending-delivery cue even when other sound cues are off.
+    pub pending_sound: bool,
     pub start_with_windows: bool,
 }
 
@@ -131,6 +136,7 @@ impl fmt::Debug for Config {
             .field("scribe_credits_per_hour", &self.scribe_credits_per_hour)
             .field("microphone", &self.microphone)
             .field("sound_cues", &self.sound_cues)
+            .field("pending_sound", &self.pending_sound)
             .field("start_with_windows", &self.start_with_windows)
             .finish()
     }
@@ -159,6 +165,7 @@ impl Default for Config {
             scribe_credits_per_hour: 585,
             microphone: None,
             sound_cues: true,
+            pending_sound: true,
             start_with_windows: false,
         }
     }

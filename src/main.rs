@@ -1164,7 +1164,7 @@ fn complete_transcription(
                             let _ = ui.hide_caret_anchor();
                             *done_until = None;
                         }
-                        play_cue(config.sound_cues, 0x20);
+                        play_cue(config.pending_sound, 0x20);
                         return;
                     }
                     mark_history_delivery(history, history_id, false);
