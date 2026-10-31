@@ -12,9 +12,13 @@ Scribetray is a Windows tray app for dictation with ElevenLabs Scribe or your lo
   <img src="docs/media/overlay-recording.gif" alt="A recording waveform beside the text cursor" width="330">
 </p>
 
-## Audio streaming in v0.9
+## Audio streaming
 
 OpenAI now uploads audio while you record, so transcription starts before you stop. Scribetray inserts the finished text after you stop, with less time spent waiting.
+
+<p align="center">
+  <img src="docs/media/streaming-speed.png" alt="Time from stop to text: batch takes 1.8 s for 64 s of speech and 3.4 s for 3 minutes; streaming takes about 0.25 s for both" width="100%">
+</p>
 
 If the stream fails, Scribetray makes one batch retry using the saved recording. It shortens long pauses for that upload when `trim_silence` is enabled. The original recording stays intact in local history.
 
@@ -65,7 +69,7 @@ The tray icon is coral when ready, blue while recording, amber while transcribin
   <img src="docs/media/tray-states.png" alt="Tray icon states on dark and light taskbars" width="520">
 </p>
 
-If you switch away before the transcript is ready, Scribetray copies it to the clipboard and waits up to 150 seconds for you to return to the original field. After that, or if you start another recording, it stops waiting and leaves the text on the clipboard.
+If you switch away before the transcript is ready, Scribetray copies it to the clipboard and waits up to 20 seconds for you to return to the original field. After that, or if you start another recording, it stops waiting and leaves the text on the clipboard.
 
 Settings live in `%APPDATA%\Scribetray\config.toml` and reload when saved. Recording changes apply to the next recording. See the [settings reference](docs/settings.md) for every option and its default.
 

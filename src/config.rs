@@ -59,10 +59,8 @@ max_seconds = 600
 scribe_credits_per_hour = 585
 # Leave blank to use the Windows default microphone.
 microphone = ""
-sound_cues = true
-# Two beeps when focus moved and the text waits for you to return to the field.
-# Independent of sound_cues.
-pending_sound = true
+# Sounds: "all", "important" (errors and pending insertion), or "off".
+sounds = "important"
 start_with_windows = false
 "#;
 
@@ -106,9 +104,7 @@ pub struct Config {
     pub scribe_credits_per_hour: u32,
     /// Selected input device name, or `None` for the system default.
     pub microphone: Option<String>,
-    pub sound_cues: bool,
-    /// Play the pending-delivery cue even when other sound cues are off.
-    pub pending_sound: bool,
+    pub sounds: Sounds,
     pub start_with_windows: bool,
 }
 
@@ -135,8 +131,7 @@ impl fmt::Debug for Config {
             .field("max_seconds", &self.max_seconds)
             .field("scribe_credits_per_hour", &self.scribe_credits_per_hour)
             .field("microphone", &self.microphone)
-            .field("sound_cues", &self.sound_cues)
-            .field("pending_sound", &self.pending_sound)
+            .field("sounds", &self.sounds)
             .field("start_with_windows", &self.start_with_windows)
             .finish()
     }
@@ -164,8 +159,7 @@ impl Default for Config {
             max_seconds: 600,
             scribe_credits_per_hour: 585,
             microphone: None,
-            sound_cues: true,
-            pending_sound: true,
+            sounds: Sounds::Important,
             start_with_windows: false,
         }
     }
@@ -179,12 +173,40 @@ pub enum Provider {
     Openai,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Sounds {
+    All,
+    #[default]
+    Important,
+    Off,
+}
+
+// Legacy keys are consumed when reading and omitted the next time settings are saved.
+fn parse_config(contents: &str) -> Result<Config, toml::de::Error> {
+    let mut value: toml::Value = toml::from_str(contents)?;
+    if let Some(table) = value.as_table_mut() {
+        if !table.contains_key("sounds")
+            && let Some(legacy) = table.get("sound_cues").cloned()
+        {
+            let legacy: bool = legacy.try_into()?;
+            table.insert(
+                "sounds".into(),
+                toml::Value::String(if legacy { "all" } else { "off" }.into()),
+            );
+        }
+        table.remove("sound_cues");
+        table.remove("pending_sound");
+    }
+    value.try_into()
+}
+
 impl Config {
     /// Loads settings from disk without creating a missing file.
     pub fn load() -> Result<Self, ConfigError> {
         let path = config_path()?;
         let contents = fs::read_to_string(path)?;
-        Ok(toml::from_str(&contents)?)
+        Ok(parse_config(&contents)?)
     }
 
     /// Loads the saved settings, creating the config directory and default file
@@ -192,7 +214,7 @@ impl Config {
     pub fn load_or_create() -> Result<Self, ConfigError> {
         let path = config_path()?;
         match fs::read_to_string(&path) {
-            Ok(contents) => Ok(toml::from_str(&contents)?),
+            Ok(contents) => Ok(parse_config(&contents)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let config = Self::default();
                 let contents = DEFAULT_CONFIG_TEMPLATE;
@@ -208,7 +230,7 @@ impl Config {
                     // Another process may have created the file after our read.
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         let contents = fs::read_to_string(&path)?;
-                        Ok(toml::from_str(&contents)?)
+                        Ok(parse_config(&contents)?)
                     }
                     Err(error) => Err(error.into()),
                 }
@@ -296,5 +318,33 @@ mod provider_tests {
         let restored: Config = toml::from_str(&toml::to_string(&openai).unwrap()).unwrap();
         assert_eq!(restored, openai);
         assert!(toml::from_str::<Config>("provider = 'other'").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sound_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_sounds_migrate_and_are_dropped_on_save() {
+        for (legacy, expected) in [(true, Sounds::All), (false, Sounds::Off)] {
+            let config = parse_config(&format!("sound_cues = {legacy}\npending_sound = true")).unwrap();
+            assert_eq!(config.sounds, expected);
+            let saved = toml::to_string(&config).unwrap();
+            assert!(!saved.contains("sound_cues"));
+            assert!(!saved.contains("pending_sound"));
+            assert_eq!(parse_config(&saved).unwrap().sounds, expected);
+        }
+    }
+
+    #[test]
+    fn sounds_parse_default_override_and_invalid_values() {
+        assert_eq!(parse_config("").unwrap().sounds, Sounds::Important);
+        for (name, expected) in [("all", Sounds::All), ("important", Sounds::Important), ("off", Sounds::Off)] {
+            let config = parse_config(&format!("sounds = '{name}'\nsound_cues = false\npending_sound = false")).unwrap();
+            assert_eq!(config.sounds, expected);
+        }
+        assert!(parse_config("sounds = 'invalid'").is_err());
+        assert!(parse_config("sounds = true").is_err());
     }
 }

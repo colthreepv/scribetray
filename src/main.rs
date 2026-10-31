@@ -32,7 +32,7 @@ use std::{
 };
 
 use audio::AudioRecorder;
-use config::{Config, Provider, config_path};
+use config::{Config, Provider, Sounds, config_path};
 use directories::BaseDirs;
 use history::{History, Recording, RecordingStatus};
 use scribe::Transcription;
@@ -52,7 +52,7 @@ const TICK: Duration = Duration::from_millis(200);
 const CARET_REFRESH: Duration = Duration::from_millis(250);
 const DONE_DISPLAY: Duration = Duration::from_millis(2_300);
 /// How long a transcript waits for the user to return to the original field.
-const PENDING_TIMEOUT: Duration = Duration::from_secs(150);
+const PENDING_TIMEOUT: Duration = Duration::from_secs(20);
 /// Time the original field must keep focus before a pending transcript is inserted.
 const PENDING_SETTLE: Duration = Duration::from_millis(50);
 /// Main loop wake-up interval while a transcript is pending.
@@ -512,7 +512,7 @@ fn handle_ui_event(
                 let _ = ui.send(UiCommand::SetRecording(false));
                 let _ = ui.send(UiCommand::SetLevelMeter(None));
                 let _ = ui.hide_caret_anchor();
-                play_cue(config.sound_cues, 0x10);
+                play_cue(config.sounds, Cue::Cancel);
             }
         }
         UiEvent::Quit => return false,
@@ -576,8 +576,8 @@ fn handle_ui_event(
             config.intercept_enter = !config.intercept_enter;
             save_config(config, ui);
         }
-        UiEvent::ToggleSound => {
-            config.sound_cues = !config.sound_cues;
+        UiEvent::SoundsSelected(sounds) => {
+            config.sounds = sounds;
             save_config(config, ui);
         }
         UiEvent::ToggleTypeMode => {
@@ -888,7 +888,7 @@ fn start_recording(
     *done_until = None;
     let _ = ui.send(UiCommand::SetRecording(true));
     let _ = ui.send(UiCommand::SetLevelMeter(Some(level_meter)));
-    play_cue(config.sound_cues, 0x40);
+    play_cue(config.sounds, Cue::Normal);
     update_timers(ui, active.as_mut(), done_until);
 }
 
@@ -926,14 +926,14 @@ fn stop_recording(
             let _ = ui.send(UiCommand::SetTrayError(true));
             let _ = ui.hide_caret_anchor();
             show_notice(ui, "Scribetray recording", &error.to_string());
-            play_cue(config.sound_cues, 0x10);
+            play_cue(config.sounds, Cue::Error);
             return;
         }
     };
 
     let _ = ui.send(UiCommand::SetRecording(false));
     let _ = ui.send(UiCommand::SetLevelMeter(None));
-    play_cue(config.sound_cues, 0x40);
+    play_cue(config.sounds, Cue::Normal);
     match history.create_pending_pcm(&captured.pcm_16k_mono, captured.duration_seconds) {
         Ok(recording) => {
             let anchor = target.caret.map(|caret| ui_caret(caret.rect));
@@ -1197,7 +1197,7 @@ fn drain_worker_events(
                     *done_until = Some(Instant::now() + DONE_DISPLAY);
                 }
                 show_notice(ui, "Scribetray transcription", &message);
-                play_cue(config.sound_cues, 0x10);
+                play_cue(config.sounds, Cue::Error);
             }
         }
         let _ = ui.send(UiCommand::SetTranscribing(deliveries.len()));
@@ -1263,7 +1263,7 @@ fn complete_transcription(
                         let _ = ui.hide_caret_anchor();
                         *done_until = None;
                     }
-                    play_cue(config.sound_cues, 0x40);
+                    play_cue(config.sounds, Cue::Normal);
                 }
                 Err(error) => {
                     if matches!(error, wininput::WinInputError::TargetChanged) {
@@ -1285,7 +1285,7 @@ fn complete_transcription(
                             let _ = ui.hide_caret_anchor();
                             *done_until = None;
                         }
-                        play_cue(config.pending_sound, 0x20);
+                        play_cue(config.sounds, Cue::Pending);
                         return;
                     }
                     mark_history_delivery(history, history_id, false);
@@ -1310,7 +1310,7 @@ fn complete_transcription(
                         set_anchor_error(ui, Some(&Delivery::Paste(target)));
                         *done_until = Some(Instant::now() + DONE_DISPLAY);
                     }
-                    play_cue(config.sound_cues, 0x10);
+                    play_cue(config.sounds, Cue::Error);
                 }
             }
         }
@@ -1338,7 +1338,7 @@ fn complete_transcription(
                 let _ = ui.hide_caret_anchor();
                 *done_until = None;
             }
-            play_cue(config.sound_cues, 0x40);
+            play_cue(config.sounds, Cue::Normal);
         }
     }
 }
@@ -1388,7 +1388,7 @@ fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &History) {
                 }
             }
             info!("pending transcript inserted after focus returned; method={method:?}");
-            play_cue(config.sound_cues, 0x40);
+            play_cue(config.sounds, Cue::Normal);
         }
         Err(wininput::WinInputError::TargetChanged) => {
             PENDING.set(Some(PendingDelivery {
@@ -1403,7 +1403,7 @@ fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &History) {
                 "Scribetray",
                 &format!("Text was not inserted ({error}); it is still on the clipboard."),
             );
-            play_cue(config.sound_cues, 0x10);
+            play_cue(config.sounds, Cue::Error);
         }
     }
 }
@@ -1508,7 +1508,7 @@ fn make_ui_settings(
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
         intercept_enter: config.intercept_enter,
-        sound_enabled: config.sound_cues,
+        sounds: config.sounds,
         type_mode: config.insert_method.eq_ignore_ascii_case("type"),
         autostart_enabled: config.start_with_windows,
         language_code: config.language.clone(),
@@ -1745,8 +1745,24 @@ fn show_notice(ui: &UiRuntime, title: &str, message: &str) {
     });
 }
 
-fn play_cue(enabled: bool, cue: u32) {
-    if !enabled {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cue {
+    Normal,
+    Cancel,
+    Error,
+    Pending,
+}
+
+fn cue_enabled(sounds: Sounds, cue: Cue) -> bool {
+    match sounds {
+        Sounds::All => true,
+        Sounds::Important => matches!(cue, Cue::Error | Cue::Pending),
+        Sounds::Off => false,
+    }
+}
+
+fn play_cue(sounds: Sounds, cue: Cue) {
+    if !cue_enabled(sounds, cue) {
         return;
     }
 
@@ -1757,10 +1773,10 @@ fn play_cue(enabled: bool, cue: u32) {
             make_cue_wave(&[523, 523], 90, 70),
         ]
     });
-    let wave = match cue {
-        0x10 => &waves[1],
-        0x20 => &waves[2],
-        _ => &waves[0],
+    let (wave, fallback) = match cue {
+        Cue::Normal => (&waves[0], 0x40),
+        Cue::Cancel | Cue::Error => (&waves[1], 0x10),
+        Cue::Pending => (&waves[2], 0x20),
     };
     let played = unsafe {
         PlaySoundW(
@@ -1771,7 +1787,7 @@ fn play_cue(enabled: bool, cue: u32) {
         .as_bool()
     };
     if !played {
-        let fallback_played = unsafe { MessageBeep(cue) != 0 };
+        let fallback_played = unsafe { MessageBeep(fallback) != 0 };
         warn!(
             "wave sound cue playback failed; Windows message beep fallback played={fallback_played}"
         );
@@ -1957,5 +1973,19 @@ mod provider_validation_tests {
         assert!(validate_config(&config).is_err());
         config.scribe_credits_per_hour = 585;
         assert!(validate_config(&config).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cue_policy_tests {
+    use super::*;
+
+    #[test]
+    fn sound_settings_filter_cue_kinds() {
+        for cue in [Cue::Normal, Cue::Cancel, Cue::Error, Cue::Pending] {
+            assert!(cue_enabled(Sounds::All, cue));
+            assert!(!cue_enabled(Sounds::Off, cue));
+            assert_eq!(cue_enabled(Sounds::Important, cue), matches!(cue, Cue::Error | Cue::Pending));
+        }
     }
 }

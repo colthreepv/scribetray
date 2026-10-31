@@ -145,7 +145,7 @@ the caret reported by Win32, Microsoft Active Accessibility or UI Automation,
 with the mouse position as a fallback.
 
 Before insertion, Scribetray checks that the original target still has focus.
-If focus moved, it copies the text to the clipboard and waits up to 150 seconds.
+If focus moved, it copies the text to the clipboard and waits up to 20 seconds.
 Returning to the target for 50 ms allows insertion. A new recording clears
 the pending insertion; expiry leaves the text on the clipboard.
 

@@ -44,14 +44,13 @@ Cancelling a streaming recording cannot retract audio already sent to the provid
 | `insert_method` | `"type"` | Simulates typing. Use `"paste"` to insert through the clipboard instead. |
 | `restore_clipboard` | `true` | Restores previous clipboard contents after paste insertion. |
 
-If the original field loses focus, Scribetray copies the transcript to the clipboard and waits up to 150 seconds for focus to return. Starting another recording ends that wait. This timeout is fixed, not a setting.
+If the original field loses focus, Scribetray copies the transcript to the clipboard and waits up to 20 seconds for focus to return. Starting another recording ends that wait. This timeout is fixed, not a setting.
 
 ## Sounds and startup
 
 | Option | Default | What it does |
 |---|---|---|
-| `sound_cues` | `true` | Plays recording, success and error sounds. |
-| `pending_sound` | `true` | Plays two beeps when text is waiting for the original field to regain focus. Independent of `sound_cues`. |
+| `sounds` | `"important"` | `"all"` plays every cue; `"important"` plays errors and pending insertion; `"off"` is silent. |
 | `start_with_windows` | `false` | Starts Scribetray when you sign in to Windows. |
 
 History keeps the latest 20 recordings in `%LOCALAPPDATA%\Scribetray\history`. The history limit is fixed, not a setting.

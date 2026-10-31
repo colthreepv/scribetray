@@ -137,3 +137,22 @@ fn openai_identity_is_single_line_and_has_no_mnemonics() {
     assert!(root[1].encode_utf16().count() <= 73);
     assert!(!root[1].chars().any(char::is_control));
 }
+
+#[test]
+fn sounds_menu_checks_selection_and_exposes_choices() {
+    use crate::config::Sounds;
+    use windows::Win32::UI::WindowsAndMessaging::MF_CHECKED;
+
+    for selected in [Sounds::All, Sounds::Important, Sounds::Off] {
+        let settings = UiSettings { sounds: selected, ..UiSettings::default() };
+        let (menu, actions) = build_tray_menu(&settings, false, None).unwrap();
+        let sounds = submenu(submenu(menu.0, "Recording"), "Sounds");
+        assert_eq!(labels(sounds), ["All", "Important", "Off"]);
+        for (position, choice) in [Sounds::All, Sounds::Important, Sounds::Off].into_iter().enumerate() {
+            let state = unsafe { GetMenuState(sounds, position as u32, MF_BYPOSITION) };
+            assert_ne!(state, u32::MAX);
+            assert_eq!(state & MF_CHECKED.0 != 0, choice == selected);
+            assert!(actions.values().any(|event| *event == UiEvent::SoundsSelected(choice)));
+        }
+    }
+}

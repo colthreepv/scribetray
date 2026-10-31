@@ -528,14 +528,23 @@ fn build_tray_menu(
         UiEvent::ToggleEnterInterception,
         &mut actions,
     )?;
-    append_check_action(
-        recording_menu.0,
-        "Sound cues",
-        11,
-        settings.sound_enabled,
-        UiEvent::ToggleSound,
-        &mut actions,
-    )?;
+    let sounds_menu = MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
+    for (label, sounds) in [
+        ("All", crate::config::Sounds::All),
+        ("Important", crate::config::Sounds::Important),
+        ("Off", crate::config::Sounds::Off),
+    ] {
+        let id = take_menu_id(&mut next_dynamic_id)?;
+        append_radio_action(
+            sounds_menu.0,
+            label,
+            id,
+            settings.sounds == sounds,
+            Some(UiEvent::SoundsSelected(sounds)),
+            &mut actions,
+        )?;
+    }
+    append_popup(recording_menu.0, sounds_menu, "Sounds")?;
     append_popup(root.0, recording_menu, "Recording")?;
 
     let insert_menu = MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
