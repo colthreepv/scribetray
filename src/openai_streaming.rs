@@ -63,7 +63,10 @@ async fn connect_and_run(
         .redirect(redirect::Policy::none())
         .retry(retry::Policy::never())
         .build()
-        .map_err(|_| "Could not initialize OpenAI streaming client")?;
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "OpenAI streaming client build failed");
+            "Could not initialize OpenAI streaming client"
+        })?;
     let connect = async {
         let response = client
             .websocket(ENDPOINT)
@@ -76,12 +79,20 @@ async fn connect_and_run(
             .max_frame_size(MAX_MESSAGE)
             .send()
             .await
-            .map_err(|_| "OpenAI streaming connection failed")?;
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "OpenAI streaming connection failed");
+                "OpenAI streaming connection failed"
+            })?;
+        let status = response.status();
         let ws = response
             .into_websocket()
             .await
-            .map_err(|_| "OpenAI streaming handshake failed")?;
+            .map_err(|e| {
+                tracing::warn!(%status, error = ?e, "OpenAI streaming handshake failed");
+                "OpenAI streaming handshake failed"
+            })?;
         if ws.protocol().and_then(|p| p.to_str().ok()) != Some("chatgpt-dictation") {
+            tracing::warn!(protocol = ?ws.protocol(), "OpenAI streaming subprotocol mismatch");
             return Err("OpenAI streaming subprotocol was not accepted");
         }
         Ok(ws)
@@ -133,7 +144,10 @@ async fn send_message(ws: &mut WebSocket, message: Message) -> Result<(), String
     timeout(SEND_TIMEOUT, ws.send(message))
         .await
         .map_err(|_| "OpenAI streaming send timed out".to_owned())?
-        .map_err(|_| "OpenAI streaming send failed".to_owned())
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "OpenAI streaming send failed");
+            "OpenAI streaming send failed".to_owned()
+        })
 }
 async fn send_json(ws: &mut WebSocket, message: Value) -> Result<(), String> {
     send_message(ws, Message::text(message.to_string())).await
@@ -196,11 +210,22 @@ async fn handle_message(
             Ok(false)
         }
         Some(Ok(Message::Pong(_))) => Ok(false),
-        Some(Ok(Message::Close(_))) | None => {
+        Some(Ok(Message::Close(frame))) => {
+            tracing::warn!(?frame, "OpenAI streaming socket closed by server");
             Err("OpenAI streaming socket closed prematurely".into())
         }
-        Some(Err(_)) => Err("OpenAI streaming receive failed".into()),
-        _ => Err("OpenAI streaming received an invalid message".into()),
+        None => {
+            tracing::warn!("OpenAI streaming socket ended without a close frame");
+            Err("OpenAI streaming socket closed prematurely".into())
+        }
+        Some(Err(e)) => {
+            tracing::warn!(error = ?e, "OpenAI streaming receive failed");
+            Err("OpenAI streaming receive failed".into())
+        }
+        Some(Ok(other)) => {
+            tracing::warn!(message = ?other, "OpenAI streaming received an unexpected message");
+            Err("OpenAI streaming received an invalid message".into())
+        }
     }
 }
 
@@ -218,8 +243,10 @@ impl State {
         if text.len() > MAX_MESSAGE {
             return Err("OpenAI streaming message too large".into());
         }
-        let event: Value =
-            serde_json::from_str(text).map_err(|_| "Invalid OpenAI streaming event")?;
+        let event: Value = serde_json::from_str(text).map_err(|e| {
+            tracing::warn!(error = %e, len = text.len(), "OpenAI streaming event is not JSON");
+            "Invalid OpenAI streaming event"
+        })?;
         match event.get("type").and_then(Value::as_str) {
             Some("session.started") => {
                 if event["session"]["status"] == "closed" {
@@ -277,12 +304,14 @@ impl State {
                 return Ok(true);
             }
             Some("session.stop_requested") => {
+                tracing::warn!(event = %event, "OpenAI streaming requested an early stop");
                 return Err("OpenAI streaming requested an early stop".into());
             }
             Some("transcript.failed")
             | Some("session.error")
             | Some("error")
             | Some("session.failed") => {
+                tracing::warn!(event = %event, "OpenAI streaming service reported an error");
                 return Err("OpenAI streaming service reported an error".into());
             }
             Some(_) => {}
