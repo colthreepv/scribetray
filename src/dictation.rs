@@ -643,7 +643,7 @@ fn language_for_api(language: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod provider_validation_tests {
+mod streaming_tests {
     use super::*;
 
     fn stream_guard() -> (StreamCancellation, tokio::sync::watch::Receiver<bool>) {

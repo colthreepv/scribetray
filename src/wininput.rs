@@ -112,8 +112,6 @@ pub enum WinInputError {
     HotkeyStillHeld,
     #[error("SendInput accepted {sent} of {expected} keyboard events")]
     PartialInput { sent: u32, expected: u32 },
-    #[error("clipboard data could not be read for preservation: {0}")]
-    ClipboardSnapshot(WindowsError),
     #[error("the clipboard owner window could not be created")]
     ClipboardOwnerUnavailable,
     #[error("the clipboard text is too large to allocate")]
@@ -253,7 +251,10 @@ fn target_window_and_focus_are_current(target: &TargetSnapshot) -> bool {
 fn paste_text(text: &str, restore_clipboard: bool) -> Result<()> {
     let owner = ClipboardOwner::create()?;
     let backup = if restore_clipboard {
-        ClipboardBackup::capture().map_err(WinInputError::ClipboardSnapshot)?
+        ClipboardBackup::capture().unwrap_or_else(|error| {
+            warn!("could not capture clipboard for preservation: {error}");
+            None
+        })
     } else {
         None
     };
@@ -798,7 +799,13 @@ impl ClipboardBackup {
             .into_iter()
             .filter(|id| snapshot_format_allowed(*id, &registered))
         {
-            let handle = HGLOBAL(unsafe { GetClipboardData(format)? }.0);
+            let handle = match unsafe { GetClipboardData(format) } {
+                Ok(handle) => HGLOBAL(handle.0),
+                Err(error) => {
+                    warn!("could not read clipboard format {format}: {error}");
+                    continue;
+                }
+            };
             let size = unsafe { GlobalSize(handle) };
             let Some(new_total) = snapshot_size_after(total, size) else {
                 info!(
@@ -808,7 +815,9 @@ impl ClipboardBackup {
             };
             let locked = unsafe { GlobalLock(handle) };
             if locked.is_null() {
-                return Err(WindowsError::from_thread());
+                let error = WindowsError::from_thread();
+                warn!("could not lock clipboard format {format}: {error}");
+                continue;
             }
             let bytes = unsafe { slice::from_raw_parts(locked.cast::<u8>(), size) }.to_vec();
             let _ = unsafe { GlobalUnlock(handle) };
@@ -850,6 +859,7 @@ impl ClipboardBackup {
             .map(|(format, bytes)| Ok((*format, GlobalMemory::copy_from(bytes)?)))
             .collect::<WindowsResult<Vec<_>>>()?;
         unsafe { EmptyClipboard()? };
+        publish_clipboard_markers(false);
         for (format, memory) in &mut prepared {
             memory.publish(*format)?;
         }
@@ -896,21 +906,38 @@ fn set_clipboard_text(owner: HWND, text: &str, temporary: bool) -> Result<()> {
     let _clipboard = ClipboardOpen::open(Some(owner))?;
     unsafe { EmptyClipboard()? };
     if temporary {
-        for name in [
-            windows::core::w!("Clipboard Viewer Ignore"),
-            windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
-            windows::core::w!("CanIncludeInClipboardHistory"),
-            windows::core::w!("CanUploadToCloudClipboard"),
-        ] {
-            let result = register_clipboard_format(name)
-                .and_then(|format| GlobalMemory::copy_from(&0_u32.to_ne_bytes())?.publish(format));
-            if let Err(error) = result {
-                warn!("could not set temporary clipboard ignore marker: {error}");
-            }
-        }
+        publish_clipboard_markers(true);
     }
     memory.publish(CF_UNICODETEXT.0 as u32)?;
     Ok(())
+}
+
+// Caller holds the clipboard open. Restore only opts out of monitor processing;
+// temporary transcripts also opt out of Windows history and cloud sync.
+fn publish_clipboard_markers(temporary: bool) {
+    let monitor_markers = [
+        windows::core::w!("Clipboard Viewer Ignore"),
+        windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
+    ];
+    let temporary_markers = [
+        windows::core::w!("CanIncludeInClipboardHistory"),
+        windows::core::w!("CanUploadToCloudClipboard"),
+    ];
+    for name in
+        monitor_markers
+            .into_iter()
+            .chain(
+                temporary_markers
+                    .into_iter()
+                    .take(if temporary { 2 } else { 0 }),
+            )
+    {
+        let result = register_clipboard_format(name)
+            .and_then(|format| GlobalMemory::copy_from(&0_u32.to_ne_bytes())?.publish(format));
+        if let Err(error) = result {
+            warn!("could not set clipboard marker {name:?}: {error}");
+        }
+    }
 }
 
 struct GlobalMemory {
@@ -1101,9 +1128,28 @@ mod tests {
         assert!(backup.restore_if_still_owned(owner.hwnd, "PASTED").unwrap());
         {
             let _clipboard = ClipboardOpen::open(None).unwrap();
-            assert_eq!(unsafe { EnumClipboardFormats(0) }, 0);
+            for name in [
+                windows::core::w!("Clipboard Viewer Ignore"),
+                windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
+            ] {
+                let format = register_clipboard_format(name).unwrap();
+                let handle = HGLOBAL(unsafe { GetClipboardData(format).unwrap() }.0);
+                assert!(unsafe { GlobalSize(handle) } >= size_of::<u32>());
+                let locked = unsafe { GlobalLock(handle) };
+                assert!(!locked.is_null());
+                assert_eq!(unsafe { *locked.cast::<u32>() }, 0);
+                let _ = unsafe { GlobalUnlock(handle) };
+            }
+            for name in [
+                windows::core::w!("CanIncludeInClipboardHistory"),
+                windows::core::w!("CanUploadToCloudClipboard"),
+            ] {
+                assert!(
+                    unsafe { GetClipboardData(register_clipboard_format(name).unwrap()) }.is_err()
+                );
+            }
         }
-        println!("empty clipboard: restored; all four temporary ignore markers: verified");
+        println!("empty clipboard: restored with monitor markers; temporary markers verified");
 
         copy_text("FALLBACK-COPY").unwrap();
         {
