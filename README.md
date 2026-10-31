@@ -2,167 +2,87 @@
   <img src="docs/media/banner.png" alt="Scribetray: speak into any text field on Windows" width="100%">
 </p>
 
-<p align="center">
-  <b>Press a hotkey, talk, and your words appear where your cursor is.</b><br>
-  A tiny Windows tray app that transcribes with ElevenLabs Scribe, or with OpenAI through your Codex ChatGPT login.
-</p>
-
-<p align="center">
-  <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white">
-  <img alt="Written in Rust" src="https://img.shields.io/badge/Rust-1.98%2B-B7410E?logo=rust&logoColor=white">
-  <img alt="License: WTFPL" src="https://img.shields.io/badge/license-WTFPL-2EA44F">
-</p>
-
----
+Scribetray is a Windows tray app for dictation with ElevenLabs Scribe or your local Codex ChatGPT login. It runs as a single executable, with no installer.
 
 1. Put your cursor in a text field.
-2. Press **Win+Alt+V** and speak. A small waveform floats next to your cursor so you know it's listening.
-3. Press **Win+Alt+V** again. A moment later the text is typed in, right where you left it.
-
-Press **Enter** instead to insert the text *and send it*, which is handy in chat boxes and AI prompts. Press **Esc**, the default cancel shortcut, to throw the recording away.
+2. Press Win+Alt+V and speak.
+3. Press Win+Alt+V again. Scribetray inserts the finished transcript when it is ready.
 
 <p align="center">
-  <img src="docs/media/overlay-recording.gif" alt="The recording overlay: a small pill with a live waveform" width="330">
+  <img src="docs/media/overlay-recording.gif" alt="A recording waveform beside the text cursor" width="330">
 </p>
 
-It works in any app you can type into, and ships as a single executable: no installer, no admin rights, no telemetry.
+## Audio streaming in v0.9
+
+OpenAI now uploads audio while you record, so transcription starts before you stop. Scribetray inserts the finished text after you stop, with less time spent waiting.
+
+If the stream fails, Scribetray makes one batch retry using the saved recording. It shortens long pauses for that upload when `trim_silence` is enabled. The original recording stays intact in local history.
+
+ElevenLabs remains the default provider and uploads after you stop. You can enable its optional streaming mode with `realtime = true`. It also inserts only the final transcript after you stop. The `realtime` setting applies only to ElevenLabs; there is no OpenAI streaming toggle.
+
+OpenAI support is experimental. It uses ChatGPT's private dictation endpoint and may break when OpenAI changes it.
 
 ## Get started
 
-Pick the provider that matches the account you already have. You can switch later by changing `provider` in the settings file. The tray icon appears faded until the selected provider has usable credentials.
+Download `scribetray.exe` from the [latest release](https://github.com/colthreepv/scribetray/releases/latest), put it somewhere permanent, and run it. Windows SmartScreen may warn because the executable is unsigned. Choose **More info**, then **Run anyway** if you want to proceed.
 
-| Provider | Sign-in | Transcription |
-|---|---|---|
-| **ElevenLabs Scribe** | ElevenLabs API key | After recording, or live while you speak |
-| **OpenAI** (experimental) | ChatGPT login saved by Codex app or CLI | Audio streams while you speak; text arrives after stop |
+Right-click the tray icon to open the menu. The icon stays faded until Scribetray finds credentials for your selected provider.
 
-OpenAI support uses the private dictation endpoint of the ChatGPT desktop app, so it may stop working if OpenAI changes it.
+### ElevenLabs
 
-### 1. Download and run
+1. Create an API key in your [ElevenLabs account](https://elevenlabs.io/app/sign-up), under Developers, API Keys.
+2. Restrict the key to Speech to Text. Add User Read permission if you want monthly credit usage in the tray menu.
+3. Choose **Set API key…** in the tray menu, enter the key in `api_key = "..."`, and save the file. Keep `provider = "elevenlabs"`.
 
-Download `scribetray.exe` from the [latest GitHub release](https://github.com/colthreepv/scribetray/releases/latest) and put it somewhere permanent, for example `%LOCALAPPDATA%\Programs\Scribetray\`. Then run it.
+You can also set `ELEVENLABS_API_KEY`, which takes precedence over the saved key.
 
-> [!NOTE]
-> The executable isn't code-signed yet, so Windows SmartScreen may warn you the first time. Choose **More info → Run anyway**. You can also [build it yourself](#build-from-source).
+### OpenAI through Codex
 
-### 2. Connect a provider
+1. Sign in to the Codex app or CLI with your ChatGPT account on this computer.
+2. Choose **Open settings file…** in the tray menu and set `provider = "openai"`.
+3. Save the file. The menu shows the detected account.
 
-#### ElevenLabs Scribe
+Scribetray reads `%CODEX_HOME%\auth.json` when `CODEX_HOME` is set, otherwise `%USERPROFILE%\.codex\auth.json`. It requires a local ChatGPT login file. API-key logins and credentials stored only in a keychain, including Windows Credential Manager, are unsupported.
 
-Scribetray uses your own ElevenLabs account, so there is no subscription to Scribetray itself.
-
-1. [Sign up at ElevenLabs](https://elevenlabs.io/app/sign-up). The free plan includes 10,000 credits a month, enough to try Scribetray properly.
-2. Open **Developers → API Keys → Create API key**.
-3. Turn on **Restrict key** and enable only:
-   - **Speech to Text**, required.
-   - **User → Read**, optional. It lets the tray menu show how much of your monthly allowance you've used.
-4. Right-click the tray icon, choose **Set API key…**, and paste the key into `api_key = "..."`. Save the file; Scribetray picks up the change immediately.
-
-Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
-
-#### OpenAI through Codex
-
-1. Sign in to Codex app or Codex CLI with your ChatGPT account on this computer.
-2. Right-click the tray icon, choose **Open settings file…**, and set `provider = "openai"`.
-3. Save the file. The menu shows the detected account; no API key is needed.
-
-Scribetray needs the ChatGPT login that Codex saves in `%USERPROFILE%\.codex\auth.json`, or in `%CODEX_HOME%\auth.json` when that variable is set. API-key logins and sessions stored only in Windows Credential Manager are not supported. Scribetray only reads the file: if the session expires, sign in again through Codex and Scribetray picks up the new login without a restart.
-
-OpenAI uploads audio while you speak, then inserts the finished transcript when you stop. If streaming fails, Scribetray retries with the complete saved recording. This happens automatically; the `realtime` setting controls ElevenLabs only.
+Scribetray only reads that file and does not renew tokens. If the session expires, sign in again through Codex. Scribetray picks up the new login without a restart.
 
 ## Everyday use
 
-| Default key | While idle | While recording |
-|---|---|---|
-| **Win+Alt+V** | Start recording | Stop and insert |
-| **Enter** | (untouched) | Stop, insert, and send, when Enter interception is enabled |
-| **Shift+Enter** | (untouched) | Passed to the app (usually a line break); keep recording |
-| **Esc** | (untouched) | Cancel the recording |
+| Default key | Action while recording |
+|---|---|
+| Win+Alt+V | Stop and insert the transcript. |
+| Enter | Stop, insert, and press Enter to send. |
+| Shift+Enter | Pass through to the app and keep recording. |
+| Esc | Cancel the recording. |
 
-Change the recording hotkey from the tray menu. `hotkey` and `cancel_hotkey` can also be set in the [settings file](#settings).
+Enter and the cancel shortcut are intercepted only while recording. Turn off **Intercept Enter while recording** in the menu to let Enter reach the app. Change the recording and cancel shortcuts in settings, or choose push-to-talk to record while holding the recording hotkey.
 
-**The tray icon** shows what's happening: a coral wave when ready, blue while recording, amber while transcribing, and a red × if something failed.
+Left-click the tray icon to copy the latest transcript or retry a failed dictation. Right-click to select a microphone or language, browse history, or change settings. Dictations start with `🎙️ ` by default; turn the prefix off in the menu if you prefer.
+
+The tray icon is coral when ready, blue while recording, amber while transcribing, and marked with a red × after an error.
 
 <p align="center">
   <img src="docs/media/tray-states.png" alt="Tray icon states on dark and light taskbars" width="520">
 </p>
 
-- **Left-click** the icon to copy your last dictation, or to retry it if it failed.
-- **Right-click** for the menu. From there you can choose the microphone and language, browse recent dictations, switch to push-to-talk, and change the recording hotkey.
+If you switch away before the transcript is ready, Scribetray copies it to the clipboard and waits up to 150 seconds for you to return to the original field. After that, or if you start another recording, it stops waiting and leaves the text on the clipboard.
 
-Turn off **Intercept Enter while recording** in the menu if you want Enter to reach the app while you dictate. The cancel shortcut and Enter are claimed only while a recording is running.
+Settings live in `%APPDATA%\Scribetray\config.toml` and reload when saved. Recording changes apply to the next recording. See the [settings reference](docs/settings.md) for every option and its default.
 
-If the field lost focus before the text was ready, Scribetray copies the text to the clipboard and waits: click back into the same field and it is typed in after a moment. After 2.5 minutes, or when you start a new recording, it stays only on the clipboard. Every dictation starts with 🎙️ by default, so readers know it was spoken; turn the prefix off in the menu.
+## Privacy and costs
 
-With ElevenLabs, the menu also shows your monthly credit usage and an estimate of the batch transcription time left. With OpenAI, it shows the signed-in account.
+Audio goes to your selected provider. OpenAI and ElevenLabs streaming send audio during recording; ElevenLabs batch sends it after you stop. Cancelling cannot retract audio already transmitted. The provider's privacy and retention policies apply.
 
-## What does it cost?
+The last 20 recordings and their transcripts stay in `%LOCALAPPDATA%\Scribetray\history`. You can delete that folder to clear them. Silence trimming changes only batch uploads, not the saved audio.
 
-Scribetray is free and open source. ElevenLabs Scribe is paid per audio duration at its current [pricing](https://elevenlabs.io/pricing); the free plan includes 10,000 credits a month, and `trim_silence` shortens long pauses before they are billed. OpenAI uses your ChatGPT login; Scribetray cannot see any dictation quota, so it shows none.
+The settings file stores your ElevenLabs API key in plain text. For OpenAI, Scribetray reads the local Codex access token and sends it only to ChatGPT. It does not save a separate copy or use the refresh token.
 
-## Privacy
+Scribetray is free. Check [ElevenLabs pricing](https://elevenlabs.io/pricing) for service costs. Scribetray cannot see your ChatGPT dictation quota.
 
-- Audio goes only to the provider you selected. OpenAI and ElevenLabs realtime send audio while you speak; ElevenLabs batch sends it when you stop. Cancelling stops further transmission but cannot retract audio already sent. The provider's privacy and retention policies apply.
-- Your last 20 recordings (audio and text) are kept on your PC in `%LOCALAPPDATA%\Scribetray\history`, so that nothing is lost when something fails. Delete that folder any time.
-- Your API key is stored in plain text in `%APPDATA%\Scribetray\config.toml`. A restricted key limits what it can do if it ever leaks.
-- With OpenAI, Scribetray reads the Codex access token locally and sends it only to ChatGPT. It does not save its own copy of the token or use the refresh token.
+## Compatibility and development
 
-## Settings
+Scribetray supports Windows 10 and 11, with most testing on Windows 11. To insert into an app running as administrator, Scribetray must also run as administrator. Try `insert_method = "paste"` if a terminal or other app does not handle simulated typing well.
 
-Most options are in the tray menu. Everything else lives in `%APPDATA%\Scribetray\config.toml`, which reloads when you save it. Changes saved during a recording apply to the next one.
+Building requires Rust 1.98+ with MSVC, CMake, NASM, and libclang. See [development instructions](docs/development.md) for setup, building, and deploying your own copy.
 
-```toml
-provider = "elevenlabs"    # or "openai": use the local Codex ChatGPT session
-api_key = ""               # or set ELEVENLABS_API_KEY
-hotkey = "Win+Alt+V"       # letters, digits, F1–F24, Space, Tab… with Win/Alt/Ctrl/Shift
-cancel_hotkey = "Esc"      # cancels the active recording; must differ from hotkey
-mode = "toggle"            # or "push_to_talk": hold the hotkey while you speak
-model = "scribe_v2"        # ElevenLabs only
-language = "auto"          # or a language code such as "ita" or "eng"
-prefix = "🎙️ "
-prefix_enabled = true
-auto_enter = false         # also press Enter after every dictation
-intercept_enter = true     # plain Enter stops recording; Shift+Enter passes through
-insert_method = "type"     # or "paste"
-restore_clipboard = true
-max_seconds = 600          # a recording stops by itself after 10 minutes
-scribe_credits_per_hour = 585 # estimated batch Scribe credits per recording hour
-microphone = ""            # blank uses the Windows default input device
-realtime = false           # ElevenLabs only; kept but ignored with OpenAI
-trim_silence = true        # shorten long pauses before batch upload
-keyterms = []              # words Scribe should expect, e.g. ["Scribetray", "Kubernetes"]
-sound_cues = true
-pending_sound = true       # two beeps when the text waits for you to return to the field
-start_with_windows = false
-```
-
-A few options deserve a word:
-
-- **`cancel_hotkey`** defaults to `Esc` and is active only while recording. Choose another shortcut, such as `Win+Alt+X`, if you need Esc in the app you are dictating into.
-- **`trim_silence`** shortens pauses longer than 0.7 seconds before batch uploads, including a retry after streaming fails. Streaming sends the original audio. Recordings too short or too noisy to judge are sent unchanged.
-- **`realtime`** works with ElevenLabs only. OpenAI ignores it, and the value is kept for when you switch back.
-
-## Good to know
-
-- **Windows only**, by design: it relies on Windows APIs for hotkeys, caret tracking, and typing. It has been tested mostly on Windows 11.
-- **Apps running as administrator** can't receive typed text from a normal app (a Windows security rule). Run Scribetray as administrator too if you need that.
-- **The waveform follows your text cursor** in most apps. Where an app doesn't expose its cursor, it appears next to the mouse pointer instead.
-- **Terminals and games** may not handle typed Unicode text well. Paste mode can help.
-
-## Build from source
-
-You need Rust 1.98+ with the MSVC toolchain, plus CMake, NASM and libclang to compile the TLS library of the OpenAI client. They are needed only to build; the downloaded EXE does not need them. See [native tool setup](docs/development.md#native-build-tools).
-
-```powershell
-git clone https://github.com/colthreepv/scribetray
-cd scribetray
-. .\scripts\native-tools.ps1
-cargo build --release --locked
-.\target\release\scribetray.exe
-```
-
-To run your own builds day to day, `scripts/deploy-latest.ps1` builds, keeps a few versioned copies, and points a stable `latest` path at the newest one. See [docs/development.md](docs/development.md).
-
-## License
-
-Scribetray is distributed under the [Do What The Fuck You Want To Public License, Version 2 (WTFPL)](LICENSE). It is an independent project and is not affiliated with or endorsed by ElevenLabs or OpenAI.
+Licensed under the [WTFPL](LICENSE). Scribetray is independent of ElevenLabs and OpenAI.
