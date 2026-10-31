@@ -17,7 +17,7 @@ Scribetray is a Windows tray app for dictation with ElevenLabs Scribe or your lo
 OpenAI now uploads audio while you record, so transcription starts before you stop. Scribetray inserts the finished text after you stop, with less time spent waiting.
 
 <p align="center">
-  <img src="docs/media/streaming-speed.png" alt="Time from stop to text: batch takes 1.8 s for 64 s of speech and 3.4 s for 3 minutes; streaming takes about 0.25 s for both" width="100%">
+  <img src="docs/media/streaming-speed.png" alt="Time from stop to text: batch takes 1.8 s for 64 s of speech and 3.4 s for 192 s; streaming takes about 0.25 s for both" width="100%">
 </p>
 
 If the stream fails, Scribetray makes one batch retry using the saved recording. It shortens long pauses for that upload when `trim_silence` is enabled. The original recording stays intact in local history.

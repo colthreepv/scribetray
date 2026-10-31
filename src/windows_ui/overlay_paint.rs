@@ -140,8 +140,10 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
             let dot_radius = OVERLAY_DOT_RADIUS_DIP * scale;
             let dot_color = record_color(alpha * pulse);
             if state.overlay_close_visible() {
+                let hot = state.overlay_close_hot();
                 if let Some(path) = circle_path(dot_x, center_y, 8.0 * scale) {
-                    fill_path(pixmap, &path, rgba8(255, 255, 255, (18.0 * alpha) as u8));
+                    let fill = if hot { 72.0 } else { 40.0 };
+                    fill_path(pixmap, &path, rgba8(255, 255, 255, (fill * alpha) as u8));
                 }
                 let reach = 3.0 * scale;
                 for direction in [-1.0, 1.0] {
@@ -151,7 +153,8 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
                         dot_x + reach,
                         center_y + direction * reach,
                     ) {
-                        stroke_path(pixmap, &path, bar_color(alpha * 0.85), 1.3 * scale);
+                        let ink = if hot { 1.0 } else { 0.85 };
+                        stroke_path(pixmap, &path, bar_color(alpha * ink), 1.5 * scale);
                     }
                 }
             } else if state.settings.push_to_talk {

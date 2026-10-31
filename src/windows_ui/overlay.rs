@@ -46,12 +46,14 @@ pub(super) const OVERLAY_FADE_IN_SECONDS: f32 = 0.12;
 pub(super) const OVERLAY_ERROR_HOLD_SECONDS: f32 = 2.0;
 pub(super) const OVERLAY_ERROR_FADE_SECONDS: f32 = 0.2;
 const DEFAULT_DPI: f32 = 96.0;
-pub(super) const OVERLAY_CLOSE_SIZE_DIP: f32 = 18.0;
-
 // There is one overlay per UI thread. Keep its mouse gesture local to that
 // thread, just like the keyboard hook's interaction state.
 thread_local! {
     static CLOSE_PRESSED: Cell<bool> = const { Cell::new(false) };
+    // Cursor is over the pill: draw the X instead of the recording dot.
+    static OVERLAY_HOVERED: Cell<bool> = const { Cell::new(false) };
+    // Cursor is over the X target: only then does the window accept clicks.
+    static CLOSE_HOT: Cell<bool> = const { Cell::new(false) };
 }
 
 impl UiState {
@@ -62,17 +64,22 @@ impl UiState {
     }
 
     pub(super) fn overlay_close_visible(&self) -> bool {
-        self.overlay_can_cancel()
-            && unsafe { GetWindowLongPtrW(self.overlay_hwnd, GWL_EXSTYLE) }
-                & WS_EX_TRANSPARENT.0 as isize
-                == 0
+        self.overlay_can_cancel() && OVERLAY_HOVERED.get()
     }
 
-    fn set_overlay_hovered(&self, hovered: bool) {
+    pub(super) fn overlay_close_hot(&self) -> bool {
+        self.overlay_close_visible() && CLOSE_HOT.get()
+    }
+
+    fn set_overlay_hovered(&self, hovered: bool, hot: bool) {
+        let hot = hovered && hot;
+        OVERLAY_HOVERED.set(hovered);
+        CLOSE_HOT.set(hot);
         unsafe {
             let style = GetWindowLongPtrW(self.overlay_hwnd, GWL_EXSTYLE);
             let transparent = WS_EX_TRANSPARENT.0 as isize;
-            let updated = if hovered {
+            // Clicks elsewhere on the pill must still reach the window below.
+            let updated = if hot {
                 style & !transparent
             } else {
                 style | transparent
@@ -80,7 +87,7 @@ impl UiState {
             if updated != style {
                 SetWindowLongPtrW(self.overlay_hwnd, GWL_EXSTYLE, updated);
             }
-            if !hovered {
+            if !hot {
                 CLOSE_PRESSED.set(false);
                 if GetCapture() == self.overlay_hwnd {
                     let _ = ReleaseCapture();
@@ -96,7 +103,20 @@ impl UiState {
             && unsafe { GetCursorPos(&mut cursor) }.is_ok()
             && unsafe { GetWindowRect(self.overlay_hwnd, &mut rect) }.is_ok()
             && point_in_rect(cursor, rect);
-        self.set_overlay_hovered(hovered);
+        let hot = hovered
+            && point_in_rect(
+                POINT {
+                    x: cursor.x - rect.left,
+                    y: cursor.y - rect.top,
+                },
+                overlay_close_rect(self.overlay_dpi_scale.max(0.5)),
+            );
+        // While the button is held, keep capture even if the cursor drifts off.
+        if CLOSE_PRESSED.get() && OVERLAY_HOVERED.get() && !hot {
+            CLOSE_HOT.set(false);
+            return;
+        }
+        self.set_overlay_hovered(hovered, hot);
     }
 
     pub(super) fn overlay_mouse_message(
@@ -241,7 +261,7 @@ impl UiState {
         self.anchor_status = None;
         self.recording_started = None;
         self.overlay_visible = false;
-        self.set_overlay_hovered(false);
+        self.set_overlay_hovered(false, false);
         self.overlay_levels = [0.0; OVERLAY_WAVE_BARS];
         self.overlay_shown = [0.0; OVERLAY_WAVE_BARS];
         unsafe {
@@ -341,13 +361,14 @@ fn point_in_rect(point: POINT, rect: RECT) -> bool {
 }
 
 pub(super) fn overlay_close_rect(scale: f32) -> RECT {
-    let left = OVERLAY_SHADOW_PAD_DIP + OVERLAY_DOT_X_DIP - OVERLAY_CLOSE_SIZE_DIP / 2.0;
-    let top = OVERLAY_SHADOW_PAD_DIP + (PILL_HEIGHT_DIP - OVERLAY_CLOSE_SIZE_DIP) / 2.0;
+    // The whole left cap of the pill, up to where the waveform starts.
+    let left = OVERLAY_SHADOW_PAD_DIP;
+    let top = OVERLAY_SHADOW_PAD_DIP;
     RECT {
         left: (left * scale).round() as i32,
         top: (top * scale).round() as i32,
-        right: ((left + OVERLAY_CLOSE_SIZE_DIP) * scale).round() as i32,
-        bottom: ((top + OVERLAY_CLOSE_SIZE_DIP) * scale).round() as i32,
+        right: ((left + OVERLAY_BAR_START_DIP) * scale).round() as i32,
+        bottom: ((top + PILL_HEIGHT_DIP) * scale).round() as i32,
     }
 }
 

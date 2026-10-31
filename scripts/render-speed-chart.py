@@ -1,4 +1,3 @@
-
 # Renders docs/media/streaming-speed.png from latencies measured with
 # examples/openai-stream-smoke (batch) and examples/openai-stream-probe (stream).
 # Run from the repo root: uv run --with pillow python scripts/render-speed-chart.py
@@ -24,7 +23,7 @@ top=170*S; bottom=455*S
 for t in range(0,5):
     x=X(t); d.line((x,top,x,bottom-22*S),fill=GRID,width=S)
     d.text((x,bottom-10*S),f"{t} s",font=small,fill=DIM,anchor="mt")
-groups=[("64 s of speech",1.8,0.25),("3 min of speech",3.4,0.24)]
+groups=[("64 s of speech",1.8,0.25),("192 s of speech",3.4,0.24)]
 y=top+4*S
 h=30*S
 for name,batch,stream in groups:

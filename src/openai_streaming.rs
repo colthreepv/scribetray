@@ -223,9 +223,22 @@ async fn handle_message(
             Err("OpenAI streaming receive failed".into())
         }
         Some(Ok(other)) => {
-            tracing::warn!(message = ?other, "OpenAI streaming received an unexpected message");
+            let (kind, len) = match &other {
+                Message::Binary(data) => ("binary", data.len()),
+                _ => ("other", 0),
+            };
+            tracing::warn!(kind, len, "OpenAI streaming received an unexpected message");
             Err("OpenAI streaming received an invalid message".into())
         }
+    }
+}
+
+/// First 500 characters of a server event, enough to see its code and message.
+fn log_excerpt(event: &Value) -> String {
+    let text = event.to_string();
+    match text.char_indices().nth(500) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text,
     }
 }
 
@@ -304,14 +317,14 @@ impl State {
                 return Ok(true);
             }
             Some("session.stop_requested") => {
-                tracing::warn!(event = %event, "OpenAI streaming requested an early stop");
+                tracing::warn!(event = %log_excerpt(&event), "OpenAI streaming requested an early stop");
                 return Err("OpenAI streaming requested an early stop".into());
             }
             Some("transcript.failed")
             | Some("session.error")
             | Some("error")
             | Some("session.failed") => {
-                tracing::warn!(event = %event, "OpenAI streaming service reported an error");
+                tracing::warn!(event = %log_excerpt(&event), "OpenAI streaming service reported an error");
                 return Err("OpenAI streaming service reported an error".into());
             }
             Some(_) => {}
