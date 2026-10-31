@@ -1,6 +1,6 @@
 [package]
 name = "scribetray"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Windows system-tray dictation with ElevenLabs Scribe or a local Codex session"
@@ -27,8 +27,9 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 url = "2.5.7"
-wreq = { version = "6.0.0-rc.31", features = ["multipart", "stream"] }
+wreq = { version = "6.0.0-rc.31", features = ["multipart", "stream", "ws"] }
 wreq-util = "3.0.0-rc.14"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

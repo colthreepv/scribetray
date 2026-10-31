@@ -286,6 +286,26 @@ impl AudioRecorder {
 
     /// Stops capture and returns the collected PCM data.
     pub fn stop(mut self) -> Result<Recording, AudioError> {
+        self.finish_recording()
+    }
+
+    /// Signals a failed stop before dropping capture and closing its audio channel.
+    pub fn stop_with_error_handler(
+        mut self,
+        on_error: impl FnOnce(),
+    ) -> Result<Recording, AudioError> {
+        let result = self.finish_recording();
+        if result.is_err() {
+            on_error();
+        }
+        result
+    }
+
+    pub fn has_failed(&self) -> bool {
+        lock_recover(&self.stream_error.fatal).is_some()
+    }
+
+    fn finish_recording(&mut self) -> Result<Recording, AudioError> {
         if let Some(stream) = self.stream.take() {
             let pause_result = stream.pause();
             drop(stream);

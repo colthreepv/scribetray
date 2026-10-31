@@ -34,7 +34,7 @@ Pick the provider that matches the account you already have. You can switch late
 | Provider | Sign-in | Transcription |
 |---|---|---|
 | **ElevenLabs Scribe** | ElevenLabs API key | After recording, or live while you speak |
-| **OpenAI** (experimental) | ChatGPT login saved by Codex app or CLI | After recording |
+| **OpenAI** (experimental) | ChatGPT login saved by Codex app or CLI | Audio streams while you speak; text arrives after stop |
 
 OpenAI support uses the private dictation endpoint of the ChatGPT desktop app, so it may stop working if OpenAI changes it.
 
@@ -68,6 +68,8 @@ Alternatively, set the `ELEVENLABS_API_KEY` environment variable.
 
 Scribetray needs the ChatGPT login that Codex saves in `%USERPROFILE%\.codex\auth.json`, or in `%CODEX_HOME%\auth.json` when that variable is set. API-key logins and sessions stored only in Windows Credential Manager are not supported. Scribetray only reads the file: if the session expires, sign in again through Codex and Scribetray picks up the new login without a restart.
 
+OpenAI uploads audio while you speak, then inserts the finished transcript when you stop. If streaming fails, Scribetray retries with the complete saved recording. This happens automatically; the `realtime` setting controls ElevenLabs only.
+
 ## Everyday use
 
 | Default key | While idle | While recording |
@@ -100,7 +102,7 @@ Scribetray is free and open source. ElevenLabs Scribe is paid per audio duration
 
 ## Privacy
 
-- Audio goes only to the provider you selected: when you stop recording, or while you speak with ElevenLabs realtime. Its privacy and retention policies apply.
+- Audio goes only to the provider you selected. OpenAI and ElevenLabs realtime send audio while you speak; ElevenLabs batch sends it when you stop. Cancelling stops further transmission but cannot retract audio already sent. The provider's privacy and retention policies apply.
 - Your last 20 recordings (audio and text) are kept on your PC in `%LOCALAPPDATA%\Scribetray\history`, so that nothing is lost when something fails. Delete that folder any time.
 - Your API key is stored in plain text in `%APPDATA%\Scribetray\config.toml`. A restricted key limits what it can do if it ever leaks.
 - With OpenAI, Scribetray reads the Codex access token locally and sends it only to ChatGPT. It does not save its own copy of the token or use the refresh token.
@@ -137,7 +139,7 @@ start_with_windows = false
 A few options deserve a word:
 
 - **`cancel_hotkey`** defaults to `Esc` and is active only while recording. Choose another shortcut, such as `Win+Alt+X`, if you need Esc in the app you are dictating into.
-- **`trim_silence`** shortens pauses longer than 0.7 seconds on your PC before upload, with either provider. Live (realtime) transcription is unaffected, and recordings too short or too noisy to judge are sent unchanged.
+- **`trim_silence`** shortens pauses longer than 0.7 seconds before batch uploads, including a retry after streaming fails. Streaming sends the original audio. Recordings too short or too noisy to judge are sent unchanged.
 - **`realtime`** works with ElevenLabs only. OpenAI ignores it, and the value is kept for when you switch back.
 
 ## Good to know

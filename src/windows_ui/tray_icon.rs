@@ -163,4 +163,3 @@ pub(super) fn display_version() -> &'static str {
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
     })
 }
-

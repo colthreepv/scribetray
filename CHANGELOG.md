@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.0
+
+OpenAI dictation now sends audio while recording and inserts the final transcript
+after stop. A failed streaming session falls back to batch transcription of the
+original recording, with silence trimming when enabled. Cancellation aborts the
+stream without starting a batch retry. ElevenLabs modes are unchanged.
+
 ## v0.7.0
 
 Adds OpenAI batch dictation using the ChatGPT session saved by Codex app or

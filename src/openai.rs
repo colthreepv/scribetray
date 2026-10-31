@@ -39,7 +39,8 @@ const AUDIO_BYTES_PER_SAMPLE: usize = 2;
 const WAV_HEADER_BYTES: u32 = 44;
 const OPENAI_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM: &str = "https://api.openai.com/profile";
-const CODEX_DESKTOP_USER_AGENT: &str = "Codex Desktop/26.1023.6621 (Windows NT 10.0; x64)";
+pub(crate) const CODEX_DESKTOP_USER_AGENT: &str =
+    "Codex Desktop/26.1023.6621 (Windows NT 10.0; x64)";
 
 /// The state of the local Codex ChatGPT session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,9 +113,15 @@ struct AuthTokens {
     account_id: Option<String>,
 }
 
-struct Session {
-    access_token: String,
-    account_id: String,
+pub(crate) struct Session {
+    pub(crate) access_token: String,
+    pub(crate) account_id: String,
+}
+
+pub(crate) fn credentials() -> Result<Session, OpenAiError> {
+    load_session_at(unix_now_secs())
+        .map(Into::into)
+        .map_err(SessionFailure::into_error)
 }
 
 impl fmt::Debug for Session {

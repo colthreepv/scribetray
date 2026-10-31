@@ -157,6 +157,16 @@ does not use CI to build or publish releases.
 
 ## Realtime transcription and fallback
 
+OpenAI opens a dictation WebSocket automatically at recording start, using the
+same read-only Codex session as batch transcription. It sends 16 kHz mono PCM16
+chunks and requests final-only transcript delivery. The UI inserts text only
+after the user stops. Connection, protocol or finalization failures fall back
+to the existing batch dispatcher, which applies `trim_silence` when enabled.
+History retains the original audio. Cancel aborts the stream without a batch
+retry; audio already transmitted remains subject to the provider's policies.
+
+The `realtime` setting below is specific to ElevenLabs.
+
 Batch mode records audio locally and submits it to Scribe after recording
 stops. Realtime mode opens an ElevenLabs Scribe v2 Realtime WebSocket when
 recording starts and streams 16 kHz mono signed 16-bit PCM. Scribetray manually
