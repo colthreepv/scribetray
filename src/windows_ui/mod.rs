@@ -376,6 +376,9 @@ unsafe extern "system" fn window_proc(
     let is_overlay = hwnd == state.overlay_hwnd;
 
     if is_overlay {
+        if let Some(result) = state.overlay_mouse_message(message, lparam) {
+            return result;
+        }
         match message {
             WM_TIMER if wparam.0 == TIMER_OVERLAY_ANIMATION => {
                 state.advance_overlay_animation();

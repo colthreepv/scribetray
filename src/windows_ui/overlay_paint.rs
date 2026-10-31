@@ -139,7 +139,22 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
             let dot_x = pad + OVERLAY_DOT_X_DIP * scale;
             let dot_radius = OVERLAY_DOT_RADIUS_DIP * scale;
             let dot_color = record_color(alpha * pulse);
-            if state.settings.push_to_talk {
+            if state.overlay_close_visible() {
+                if let Some(path) = circle_path(dot_x, center_y, 8.0 * scale) {
+                    fill_path(pixmap, &path, rgba8(255, 255, 255, (18.0 * alpha) as u8));
+                }
+                let reach = 3.0 * scale;
+                for direction in [-1.0, 1.0] {
+                    if let Some(path) = line_path(
+                        dot_x - reach,
+                        center_y - direction * reach,
+                        dot_x + reach,
+                        center_y + direction * reach,
+                    ) {
+                        stroke_path(pixmap, &path, bar_color(alpha * 0.85), 1.3 * scale);
+                    }
+                }
+            } else if state.settings.push_to_talk {
                 if let Some(path) = circle_path(dot_x, center_y, dot_radius) {
                     stroke_path(pixmap, &path, dot_color, 1.5 * scale);
                 }
