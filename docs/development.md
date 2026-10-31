@@ -149,8 +149,14 @@ If focus moved, it copies the text to the clipboard and waits up to 20 seconds.
 Returning to the target for 50 ms allows insertion. A new recording clears
 the pending insertion; expiry leaves the text on the clipboard.
 
-Type mode sends Unicode keyboard input. Paste mode temporarily changes the
-clipboard and can restore its previous contents. It preserves clipboard data
-changed by another app during the paste. Check text insertion in browser
-editors and terminals when changing this code, since their focus and caret
-reporting vary.
+Type mode sends Unicode keyboard input. Paste mode snapshots supported HGLOBAL
+formats (Unicode text, DIB/DIBV5 images, file drops and Preferred DropEffect,
+HTML, RTF and PNG) as owned bytes, up to 64 MiB total. Larger or unsupported-only
+clipboards leave the transcript on the clipboard instead of restoring. GDI
+handles and other formats are not preserved. Temporary paste text carries
+clipboard-manager/history/cloud exclusion markers; fallback and pending copies
+remain ordinary clipboard text. Clipboard opens retry for up to 108 ms; close
+failures are logged without failing the paste. Restore checks ownership/text
+under the same clipboard lock and preserves newer contents from other apps.
+Check text insertion in browser editors and terminals when changing this code,
+since their focus and caret reporting vary.

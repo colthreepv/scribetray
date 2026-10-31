@@ -1,8 +1,9 @@
 //! Windows focus, caret, clipboard, and text input helpers.
 //!
-//! Clipboard restoration uses an `IDataObject` obtained with `OleGetClipboard`, so
-//! formats exposed by the original clipboard object are retained where the source
-//! data object supports them. The temporary paste payload itself is CF_UNICODETEXT.
+//! Paste mode snapshots a small whitelist of HGLOBAL clipboard formats as owned
+//! bytes (up to 64 MiB), then restores them only while our temporary text remains.
+//! Temporary transcripts opt out of clipboard managers/history; fallback copies
+//! remain ordinary CF_UNICODETEXT. GDI handles and arbitrary formats are not saved.
 
 use std::mem::{ManuallyDrop, size_of};
 use std::ptr;
@@ -12,20 +13,22 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tracing::{info, warn};
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HINSTANCE, HWND, POINT};
+use windows::Win32::Foundation::{
+    ERROR_SUCCESS, GetLastError, HANDLE, HGLOBAL, HINSTANCE, HWND, POINT, SetLastError,
+};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject, SAFEARRAY};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, SAFEARRAY};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
-    OpenClipboard, SetClipboardData,
+    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{
-    CF_UNICODETEXT, OleGetClipboard, OleInitialize, OleSetClipboard, OleUninitialize,
-    SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT, OleInitialize, OleUninitialize, SafeArrayDestroy,
+    SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Accessibility::{
@@ -173,7 +176,7 @@ fn same_input_target(expected: &TargetSnapshot, current: &TargetSnapshot) -> boo
 
 /// Insert text only if the captured focus is still current.
 ///
-/// For paste mode, the prior clipboard data object is restored after a short
+/// For paste mode, supported prior clipboard formats are restored after a short
 /// delay to let the target consume Ctrl+V when `restore_clipboard` is true.
 pub fn insert_text(
     target: &TargetSnapshot,
@@ -196,7 +199,7 @@ pub fn insert_text(
 /// Replace clipboard contents with Unicode text, for use when the focus guard fails.
 pub fn copy_text(text: &str) -> Result<()> {
     let owner = ClipboardOwner::create()?;
-    set_clipboard_text(owner.hwnd, text)
+    set_clipboard_text(owner.hwnd, text, false)
 }
 
 /// Returns true while the captured window and focused element are active again.
@@ -250,12 +253,12 @@ fn target_window_and_focus_are_current(target: &TargetSnapshot) -> bool {
 fn paste_text(text: &str, restore_clipboard: bool) -> Result<()> {
     let owner = ClipboardOwner::create()?;
     let backup = if restore_clipboard {
-        Some(ClipboardBackup::capture().map_err(WinInputError::ClipboardSnapshot)?)
+        ClipboardBackup::capture().map_err(WinInputError::ClipboardSnapshot)?
     } else {
         None
     };
 
-    let insert_result = set_clipboard_text(owner.hwnd, text).and_then(|()| {
+    let insert_result = set_clipboard_text(owner.hwnd, text, true).and_then(|()| {
         send_ctrl_v()?;
         sleep(Duration::from_millis(200));
         Ok(())
@@ -708,44 +711,117 @@ struct ClipboardOpen;
 
 impl ClipboardOpen {
     fn open(owner: Option<HWND>) -> WindowsResult<Self> {
-        unsafe { OpenClipboard(owner)? };
-        Ok(Self)
+        for attempt in 0..10 {
+            match unsafe { OpenClipboard(owner) } {
+                Ok(()) => return Ok(Self),
+                Err(error) if attempt == 9 => return Err(error),
+                Err(_) => sleep(Duration::from_millis(12)),
+            }
+        }
+        unreachable!()
     }
 }
 
 impl Drop for ClipboardOpen {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseClipboard();
+            if let Err(error) = CloseClipboard() {
+                // Published data is already owned by Windows. Do not report a
+                // successful paste as failed because a listener raced the close.
+                warn!("CloseClipboard failed after clipboard access: {error}");
+            }
         }
     }
 }
 
-enum ClipboardBackup {
-    Empty,
-    Data(IDataObject),
+const CLIPBOARD_SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
+const SNAPSHOT_REGISTERED_FORMATS: [PCWSTR; 4] = [
+    windows::core::w!("HTML Format"),
+    windows::core::w!("Rich Text Format"),
+    windows::core::w!("PNG"),
+    windows::core::w!("Preferred DropEffect"),
+];
+
+fn register_clipboard_format(name: PCWSTR) -> WindowsResult<u32> {
+    let format = unsafe { RegisterClipboardFormatW(name) };
+    if format == 0 {
+        Err(WindowsError::from_thread())
+    } else {
+        Ok(format)
+    }
+}
+
+fn snapshot_format_allowed(format: u32, registered: &[u32]) -> bool {
+    [CF_UNICODETEXT, CF_DIB, CF_DIBV5, CF_HDROP]
+        .iter()
+        .any(|allowed| format == u32::from(allowed.0))
+        || (format >= 0xc000 && registered.contains(&format))
+}
+
+fn snapshot_size_after(total: usize, next: usize) -> Option<usize> {
+    total
+        .checked_add(next)
+        .filter(|size| *size <= CLIPBOARD_SNAPSHOT_LIMIT)
+}
+
+struct ClipboardBackup {
+    // An empty vector represents an originally empty clipboard.
+    formats: Vec<(u32, Vec<u8>)>,
 }
 
 impl ClipboardBackup {
-    fn capture() -> WindowsResult<Self> {
-        let has_formats = {
-            let _clipboard = ClipboardOpen::open(None)?;
-            unsafe { EnumClipboardFormats(0) != 0 }
-        };
-        if !has_formats {
-            return Ok(Self::Empty);
-        }
-        unsafe { OleGetClipboard() }.map(Self::Data)
-    }
-
-    fn restore(self, owner: HWND) -> WindowsResult<()> {
-        match self {
-            Self::Empty => {
-                let _clipboard = ClipboardOpen::open(Some(owner))?;
-                unsafe { EmptyClipboard() }
+    fn capture() -> WindowsResult<Option<Self>> {
+        let registered = SNAPSHOT_REGISTERED_FORMATS
+            .map(register_clipboard_format)
+            .into_iter()
+            .collect::<WindowsResult<Vec<_>>>()?;
+        let _clipboard = ClipboardOpen::open(None)?;
+        // Enumerate before requesting data: GetClipboardData can trigger delayed
+        // rendering in the source app. Never request untrusted handle formats.
+        let mut available = Vec::new();
+        let mut format = 0;
+        loop {
+            unsafe { SetLastError(ERROR_SUCCESS) };
+            format = unsafe { EnumClipboardFormats(format) };
+            if format == 0 {
+                if unsafe { GetLastError() } != ERROR_SUCCESS {
+                    return Err(WindowsError::from_thread());
+                }
+                break;
             }
-            Self::Data(data) => unsafe { OleSetClipboard(Some(&data)) },
+            available.push(format);
         }
+        let was_empty = available.is_empty();
+        let mut formats = Vec::new();
+        let mut total = 0;
+        for format in available
+            .into_iter()
+            .filter(|id| snapshot_format_allowed(*id, &registered))
+        {
+            let handle = HGLOBAL(unsafe { GetClipboardData(format)? }.0);
+            let size = unsafe { GlobalSize(handle) };
+            let Some(new_total) = snapshot_size_after(total, size) else {
+                info!(
+                    "clipboard was too large to preserve (over 64 MiB); leaving transcript on clipboard"
+                );
+                return Ok(None);
+            };
+            let locked = unsafe { GlobalLock(handle) };
+            if locked.is_null() {
+                return Err(WindowsError::from_thread());
+            }
+            let bytes = unsafe { slice::from_raw_parts(locked.cast::<u8>(), size) }.to_vec();
+            let _ = unsafe { GlobalUnlock(handle) };
+            formats.push((format, bytes));
+            total = new_total;
+        }
+        if !was_empty && formats.is_empty() {
+            info!(
+                "clipboard has no supported formats to preserve; leaving transcript on clipboard"
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self { formats }))
     }
 
     fn restore_if_still_owned(
@@ -753,35 +829,36 @@ impl ClipboardBackup {
         temporary_owner: HWND,
         pasted_text: &str,
     ) -> WindowsResult<bool> {
-        let still_contains_pasted_text = if unsafe { GetClipboardOwner()? } == temporary_owner {
-            true
-        } else {
-            let mut matches = false;
-            for attempt in 0..5 {
-                if clipboard_text_matches(pasted_text) {
-                    matches = true;
-                    break;
-                }
-                if attempt < 4 {
-                    sleep(Duration::from_millis(20));
-                }
-            }
-            matches
-        };
+        // Check and restore under the same lock so a newer copy cannot slip in
+        // between the ownership/text comparison and EmptyClipboard.
+        let _clipboard = ClipboardOpen::open(Some(temporary_owner))?;
+        // A source process can exit while its clipboard data remains. The
+        // windows-rs wrapper reports a null owner as Err (with possibly stale
+        // last-error state); it still needs the text comparison in that case.
+        let still_contains_pasted_text = unsafe { GetClipboardOwner() }.ok()
+            == Some(temporary_owner)
+            || clipboard_text_matches(pasted_text);
         if !still_contains_pasted_text {
             // Another application has replaced our temporary text with newer
             // clipboard contents; leave those contents intact.
             return Ok(false);
         }
-        self.restore(temporary_owner)?;
+        // Allocate all replacement blocks before discarding the current data.
+        let mut prepared = self
+            .formats
+            .iter()
+            .map(|(format, bytes)| Ok((*format, GlobalMemory::copy_from(bytes)?)))
+            .collect::<WindowsResult<Vec<_>>>()?;
+        unsafe { EmptyClipboard()? };
+        for (format, memory) in &mut prepared {
+            memory.publish(*format)?;
+        }
         Ok(true)
     }
 }
 
 fn clipboard_text_matches(expected: &str) -> bool {
-    let Ok(_clipboard) = ClipboardOpen::open(None) else {
-        return false;
-    };
+    // Caller holds ClipboardOpen for the entire check/restore transaction.
     let Ok(handle) = (unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }) else {
         return false;
     };
@@ -804,7 +881,7 @@ fn clipboard_text_matches(expected: &str) -> bool {
     matches
 }
 
-fn set_clipboard_text(owner: HWND, text: &str) -> Result<()> {
+fn set_clipboard_text(owner: HWND, text: &str, temporary: bool) -> Result<()> {
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
     utf16.push(0);
     let bytes = utf16
@@ -812,33 +889,57 @@ fn set_clipboard_text(owner: HWND, text: &str) -> Result<()> {
         .checked_mul(size_of::<u16>())
         .ok_or(WinInputError::ClipboardTextTooLarge)?;
 
-    let mut memory = GlobalMemory {
-        handle: unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes)? },
-        transferred: false,
-    };
-    let locked = unsafe { GlobalLock(memory.handle) };
-    if locked.is_null() {
-        return Err(WinInputError::Windows(WindowsError::from_thread()));
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(utf16.as_ptr(), locked.cast::<u16>(), utf16.len());
-        let _ = GlobalUnlock(memory.handle);
-    }
+    let mut memory = GlobalMemory::copy_from(unsafe {
+        slice::from_raw_parts(utf16.as_ptr().cast::<u8>(), bytes)
+    })?;
 
     let _clipboard = ClipboardOpen::open(Some(owner))?;
     unsafe { EmptyClipboard()? };
-    match unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(memory.handle.0))) } {
-        Ok(_) => {
-            memory.transferred = true;
-            Ok(())
+    if temporary {
+        for name in [
+            windows::core::w!("Clipboard Viewer Ignore"),
+            windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
+            windows::core::w!("CanIncludeInClipboardHistory"),
+            windows::core::w!("CanUploadToCloudClipboard"),
+        ] {
+            let result = register_clipboard_format(name)
+                .and_then(|format| GlobalMemory::copy_from(&0_u32.to_ne_bytes())?.publish(format));
+            if let Err(error) = result {
+                warn!("could not set temporary clipboard ignore marker: {error}");
+            }
         }
-        Err(error) => Err(WinInputError::Windows(error)),
     }
+    memory.publish(CF_UNICODETEXT.0 as u32)?;
+    Ok(())
 }
 
 struct GlobalMemory {
     handle: HGLOBAL,
     transferred: bool,
+}
+
+impl GlobalMemory {
+    fn copy_from(bytes: &[u8]) -> WindowsResult<Self> {
+        let memory = Self {
+            handle: unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))? },
+            transferred: false,
+        };
+        let locked = unsafe { GlobalLock(memory.handle) };
+        if locked.is_null() {
+            return Err(WindowsError::from_thread());
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), locked.cast::<u8>(), bytes.len());
+            let _ = GlobalUnlock(memory.handle);
+        }
+        Ok(memory)
+    }
+
+    fn publish(&mut self, format: u32) -> WindowsResult<()> {
+        unsafe { SetClipboardData(format, Some(HANDLE(self.handle.0)))? };
+        self.transferred = true;
+        Ok(())
+    }
 }
 
 impl Drop for GlobalMemory {
@@ -848,5 +949,177 @@ impl Drop for GlobalMemory {
                 let _ = windows::Win32::Foundation::GlobalFree(Some(self.handle));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows::Win32::System::Ole::{
+        CF_BITMAP, CF_ENHMETAFILE, CF_LOCALE, CF_METAFILEPICT, CF_OEMTEXT, CF_PALETTE, CF_TEXT,
+    };
+
+    #[test]
+    fn snapshot_whitelist_only_allows_supported_hglobal_formats() {
+        let registered = [0xc001, 0xc002, 0xc003, 0xc004];
+        for format in [CF_UNICODETEXT, CF_DIB, CF_DIBV5, CF_HDROP] {
+            assert!(snapshot_format_allowed(u32::from(format.0), &registered));
+        }
+        for format in registered {
+            assert!(snapshot_format_allowed(format, &registered));
+        }
+        for format in [
+            CF_BITMAP,
+            CF_ENHMETAFILE,
+            CF_METAFILEPICT,
+            CF_PALETTE,
+            CF_TEXT,
+            CF_OEMTEXT,
+            CF_LOCALE,
+        ] {
+            assert!(!snapshot_format_allowed(u32::from(format.0), &registered));
+        }
+        for format in [0, 0xc005, u32::MAX] {
+            assert!(!snapshot_format_allowed(format, &registered));
+        }
+        // Registration failure (0) must never accidentally whitelist a format.
+        assert!(!snapshot_format_allowed(0, &[0]));
+    }
+
+    #[test]
+    fn snapshot_cap_is_inclusive_and_checks_total_and_overflow() {
+        assert_eq!(snapshot_size_after(0, 0), Some(0));
+        assert_eq!(
+            snapshot_size_after(0, CLIPBOARD_SNAPSHOT_LIMIT),
+            Some(CLIPBOARD_SNAPSHOT_LIMIT)
+        );
+        assert_eq!(
+            snapshot_size_after(CLIPBOARD_SNAPSHOT_LIMIT - 4, 4),
+            Some(CLIPBOARD_SNAPSHOT_LIMIT)
+        );
+        assert_eq!(snapshot_size_after(CLIPBOARD_SNAPSHOT_LIMIT, 1), None);
+        assert_eq!(snapshot_size_after(1, CLIPBOARD_SNAPSHOT_LIMIT), None);
+        assert_eq!(snapshot_size_after(0, CLIPBOARD_SNAPSHOT_LIMIT + 1), None);
+        assert_eq!(snapshot_size_after(usize::MAX, 1), None);
+    }
+
+    fn powershell(script: &str) -> String {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn clipboard probe");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().expect("poll clipboard probe").is_some() {
+                let output = child.wait_with_output().expect("read clipboard probe");
+                assert!(
+                    output.status.success(),
+                    "PowerShell failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return String::from_utf8(output.stdout).expect("UTF-8 probe output");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("clipboard probe exceeded its 10-second deadline");
+            }
+            sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the real Windows clipboard and PowerShell child processes"]
+    fn live_clipboard_snapshot_roundtrip() {
+        let owner = ClipboardOwner::create().expect("clipboard owner");
+        for round in 1..=8 {
+            let original = format!("ORIGINAL-{}-{round}", std::process::id());
+            powershell(&format!("Set-Clipboard '{original}'"));
+            let backup = ClipboardBackup::capture().unwrap().expect("text snapshot");
+            set_clipboard_text(owner.hwnd, "PASTED", true).unwrap();
+            assert!(backup.restore_if_still_owned(owner.hwnd, "PASTED").unwrap());
+            let actual = powershell("[Console]::Write((Get-Clipboard -Raw))");
+            assert_eq!(actual, original);
+            println!("text round {round}/8: restored original verified by another process");
+        }
+
+        // Persistent HTML from a separate process also exercises registered
+        // HGLOBAL formats, without depending on the source process staying alive.
+        powershell(
+            "Add-Type -AssemblyName System.Windows.Forms; $data = New-Object System.Windows.Forms.DataObject; $data.SetData('HTML Format', '<html><body>ORIGINAL-HTML</body></html>'); [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)",
+        );
+        let backup = ClipboardBackup::capture().unwrap().expect("HTML snapshot");
+        set_clipboard_text(owner.hwnd, "PASTED", true).unwrap();
+        assert!(backup.restore_if_still_owned(owner.hwnd, "PASTED").unwrap());
+        assert_eq!(
+            powershell(
+                "Add-Type -AssemblyName System.Windows.Forms; [Console]::Write([System.Windows.Forms.Clipboard]::GetData('HTML Format'))"
+            ),
+            "<html><body>ORIGINAL-HTML</body></html>"
+        );
+        println!("HTML: restored original verified by another process");
+
+        let backup = ClipboardBackup::capture().unwrap().unwrap();
+        set_clipboard_text(owner.hwnd, "PASTED", true).unwrap();
+        powershell("Set-Clipboard 'NEWER-CONTENTS'");
+        assert!(!backup.restore_if_still_owned(owner.hwnd, "PASTED").unwrap());
+        assert_eq!(
+            powershell("[Console]::Write((Get-Clipboard -Raw))"),
+            "NEWER-CONTENTS"
+        );
+        println!("newer contents: preserved");
+
+        {
+            let _clipboard = ClipboardOpen::open(Some(owner.hwnd)).unwrap();
+            unsafe { EmptyClipboard().unwrap() };
+        }
+        let backup = ClipboardBackup::capture().unwrap().unwrap();
+        assert!(backup.formats.is_empty());
+        set_clipboard_text(owner.hwnd, "PASTED", true).unwrap();
+        {
+            let _clipboard = ClipboardOpen::open(None).unwrap();
+            for name in [
+                windows::core::w!("Clipboard Viewer Ignore"),
+                windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
+                windows::core::w!("CanIncludeInClipboardHistory"),
+                windows::core::w!("CanUploadToCloudClipboard"),
+            ] {
+                let format = register_clipboard_format(name).unwrap();
+                let handle = HGLOBAL(unsafe { GetClipboardData(format).unwrap() }.0);
+                let locked = unsafe { GlobalLock(handle) };
+                assert!(!locked.is_null());
+                assert_eq!(unsafe { *locked.cast::<u32>() }, 0);
+                let _ = unsafe { GlobalUnlock(handle) };
+            }
+        }
+        assert!(backup.restore_if_still_owned(owner.hwnd, "PASTED").unwrap());
+        {
+            let _clipboard = ClipboardOpen::open(None).unwrap();
+            assert_eq!(unsafe { EnumClipboardFormats(0) }, 0);
+        }
+        println!("empty clipboard: restored; all four temporary ignore markers: verified");
+
+        copy_text("FALLBACK-COPY").unwrap();
+        {
+            let _clipboard = ClipboardOpen::open(None).unwrap();
+            assert!(clipboard_text_matches("FALLBACK-COPY"));
+            for name in [
+                windows::core::w!("Clipboard Viewer Ignore"),
+                windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"),
+                windows::core::w!("CanIncludeInClipboardHistory"),
+                windows::core::w!("CanUploadToCloudClipboard"),
+            ] {
+                assert!(
+                    unsafe { GetClipboardData(register_clipboard_format(name).unwrap()) }.is_err()
+                );
+            }
+        }
+        println!("fallback copy: text retained, no ignore markers");
     }
 }
