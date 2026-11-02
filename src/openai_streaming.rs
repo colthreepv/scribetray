@@ -1,5 +1,5 @@
 //! Streaming dictation using the existing, read-only Codex session.
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -211,10 +211,23 @@ async fn handle_message(
         }
         Some(Ok(Message::Pong(_))) => Ok(false),
         Some(Ok(Message::Close(frame))) => {
+            if finishing && state.complete_after_close() {
+                tracing::warn!(
+                    ?frame,
+                    "OpenAI streaming socket closed after finals were complete"
+                );
+                return Ok(true);
+            }
             tracing::warn!(?frame, "OpenAI streaming socket closed by server");
             Err("OpenAI streaming socket closed prematurely".into())
         }
         None => {
+            if finishing && state.complete_after_close() {
+                tracing::warn!(
+                    "OpenAI streaming socket ended without a close frame after finals were complete"
+                );
+                return Ok(true);
+            }
             tracing::warn!("OpenAI streaming socket ended without a close frame");
             Err("OpenAI streaming socket closed prematurely".into())
         }
@@ -247,6 +260,7 @@ struct State {
     ready: bool,
     started_at: Option<Instant>,
     finish_at: Option<Instant>,
+    started_utterances: HashSet<String>,
     // Retain first-seen order and only the newest authoritative final.
     finals: Vec<(String, i64, String)>,
     transcript_bytes: usize,
@@ -274,6 +288,18 @@ impl State {
                     return Err("OpenAI streaming format or delivery mode mismatch".into());
                 }
                 self.ready = true;
+            }
+            Some("speech.started") => {
+                let id = event["utterance_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("Invalid OpenAI speech started event")?;
+                if !self.started_utterances.contains(id)
+                    && self.started_utterances.len() >= MAX_UTTERANCES
+                {
+                    return Err("Too many OpenAI streaming utterances".into());
+                }
+                self.started_utterances.insert(id.to_owned());
             }
             Some("transcript.final") => {
                 tracing::info!(
@@ -331,6 +357,14 @@ impl State {
             None => return Err("Invalid OpenAI streaming event".into()),
         }
         Ok(false)
+    }
+    fn complete_after_close(&self) -> bool {
+        self.finish_at.is_some()
+            && !self.finals.is_empty()
+            && self
+                .started_utterances
+                .iter()
+                .all(|id| self.finals.iter().any(|(final_id, _, _)| final_id == id))
     }
     fn transcription(self) -> Result<Transcription, String> {
         let text = self
@@ -492,6 +526,78 @@ mod tests {
             }
             assert!(task.await.unwrap().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_accepts_restart_only_when_started_utterances_are_final() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        for complete in [true, false] {
+            let (ws, mut server) = socket_pair().await;
+            let (tx, rx) = mpsc::unbounded_channel();
+            drop(tx);
+            let task = tokio::spawn(run(ws, rx, ready()));
+            for _ in 0..2 {
+                server.next().await.unwrap().unwrap();
+            }
+            server
+                .send(ServerMessage::Text(
+                    r#"{"type":"speech.started","utterance_id":"one"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            if !complete {
+                server
+                    .send(ServerMessage::Text(
+                        r#"{"type":"speech.started","utterance_id":"two"}"#.into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            server
+                .send(ServerMessage::Text(FINAL.into()))
+                .await
+                .unwrap();
+            server
+                .close(Some(CloseFrame {
+                    code: CloseCode::Restart,
+                    reason: "service restart".into(),
+                }))
+                .await
+                .unwrap();
+            let result = task.await.unwrap();
+            if complete {
+                assert_eq!(result.unwrap().text, "hello");
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_end_requires_finishing_and_complete_finals() {
+        let (mut ws, _server) = socket_pair().await;
+        let mut state = ready();
+        state
+            .event(r#"{"type":"speech.started","utterance_id":"one"}"#, false)
+            .unwrap();
+        state.event(FINAL, false).unwrap();
+        assert!(
+            handle_message(&mut ws, &mut state, None, true)
+                .await
+                .is_err()
+        );
+        state.finish_at = Some(Instant::now());
+        assert!(
+            handle_message(&mut ws, &mut state, None, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            handle_message(&mut ws, &mut state, None, true)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
