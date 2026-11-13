@@ -184,3 +184,23 @@ if (([string]$ghLogin).Trim() -ne 'colthreepv') { throw "Expected GitHub account
 & gh release create $tag $exePath $zipPath $checksumsPath --repo $githubRepo --verify-tag --title "Scribetray $tag" --notes-file $notesPath
 if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed for $tag." }
 Write-Host "Published https://github.com/$githubRepo/releases/tag/$tag"
+
+# Local builds of this exact executable are now the published release: drop the
+# candidate label from their build.json so the tray shows the plain version.
+$deployConfigPath = Join-Path $env:APPDATA 'Scribetray\deploy.json'
+$buildRoot = if ($env:SCRIBETRAY_BUILD_ROOT) { $env:SCRIBETRAY_BUILD_ROOT }
+    elseif ((Test-Path -LiteralPath $deployConfigPath -PathType Leaf) -and
+            ($deployBuildRoot = (Get-Content -LiteralPath $deployConfigPath -Raw | ConvertFrom-Json).buildRoot)) {
+        [Environment]::ExpandEnvironmentVariables($deployBuildRoot)
+    }
+    else { Join-Path $env:LOCALAPPDATA 'Scribetray\builds' }
+if (Test-Path -LiteralPath $buildRoot -PathType Container) {
+    foreach ($buildJson in Get-ChildItem -LiteralPath $buildRoot -Filter 'build.json' -Recurse -File -ErrorAction SilentlyContinue) {
+        $build = Get-Content -LiteralPath $buildJson.FullName -Raw | ConvertFrom-Json
+        if ($build.executableSha256 -ne $releaseInfo.executableSha256 -or -not $build.candidateLabel) { continue }
+        $build.candidateLabel = $null
+        $build | Add-Member -NotePropertyName releasedTag -NotePropertyValue $tag -Force
+        $build | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $buildJson.FullName -Encoding utf8
+        Write-Host "Marked local build '$($buildJson.Directory.FullName)' as released $tag."
+    }
+}

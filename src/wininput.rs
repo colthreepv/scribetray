@@ -27,14 +27,19 @@ use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{
-    CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT, OleInitialize, OleUninitialize, SafeArrayDestroy,
-    SafeArrayGetDim, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT, OleInitialize, OleUninitialize,
+    SafeArrayCreateVector, SafeArrayDestroy, SafeArrayGetDim, SafeArrayGetElement,
+    SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayPutElement,
 };
-use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
+use windows::Win32::System::Variant::{
+    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_I4,
+};
 use windows::Win32::UI::Accessibility::{
     AccessibleObjectFromWindow, CUIAutomation, IAccessible, IUIAutomation, IUIAutomationElement,
     IUIAutomationTextPattern, IUIAutomationTextPattern2, IUIAutomationTextRange,
-    UIA_TextPattern2Id, UIA_TextPatternId,
+    IUIAutomationValuePattern, TreeScope_Descendants, UIA_CONTROLTYPE_ID,
+    UIA_ComboBoxControlTypeId, UIA_EditControlTypeId, UIA_IsValuePatternAvailablePropertyId,
+    UIA_RuntimeIdPropertyId, UIA_TextPattern2Id, UIA_TextPatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -86,6 +91,128 @@ pub struct TargetSnapshot {
     /// separate editor fields inside a Chromium window).
     pub focused_runtime_id: Option<Vec<i32>>,
     pub caret: Option<CaretSnapshot>,
+}
+
+#[derive(Debug)]
+pub enum RefocusOutcome {
+    Refocused,
+    OtherWindow,
+    NoRuntimeId,
+    UserEditing,
+    OriginalGone,
+    OriginalOffscreen,
+    RefocusFailed,
+    Failed,
+}
+
+/// Restore the captured element only when focus moved within its window to a non-editor.
+pub fn refocus_original(target: &TargetSnapshot) -> RefocusOutcome {
+    if unsafe { GetForegroundWindow() } != target.foreground {
+        return RefocusOutcome::OtherWindow;
+    }
+    let Some(id) = target.focused_runtime_id.as_deref() else {
+        return RefocusOutcome::NoRuntimeId;
+    };
+    match refocus_original_inner(target, id) {
+        Ok(outcome) => outcome,
+        Err(_) => RefocusOutcome::Failed,
+    }
+}
+
+fn refocus_original_inner(target: &TargetSnapshot, id: &[i32]) -> WindowsResult<RefocusOutcome> {
+    let _com = ComApartment::initialize()?;
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? };
+    let focused = unsafe { automation.GetFocusedElement()? };
+    if focused_is_editable(&focused)? {
+        return Ok(RefocusOutcome::UserEditing);
+    }
+
+    let invalid_argument =
+        || WindowsError::from_hresult(windows::core::HRESULT(0x80070057_u32 as i32));
+    let count = u32::try_from(id.len()).map_err(|_| invalid_argument())?;
+    let array = unsafe { SafeArrayCreateVector(VT_I4, 0, count) };
+    if array.is_null() {
+        return Err(WindowsError::from_hresult(windows::core::HRESULT(
+            0x8007000e_u32 as i32,
+        )));
+    }
+    let guard = SafeArrayGuard(array);
+    for (index, value) in id.iter().enumerate() {
+        let index = i32::try_from(index).map_err(|_| invalid_argument())?;
+        unsafe { SafeArrayPutElement(guard.0, &index, (value as *const i32).cast())? };
+    }
+    // VARIANT owns the SAFEARRAY and clears it when dropped.
+    let value = VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VARENUM(VT_ARRAY.0 | VT_I4.0),
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { parray: guard.0 },
+            }),
+        },
+    };
+    std::mem::forget(guard);
+    let root = unsafe { automation.ElementFromHandle(target.foreground)? };
+    let condition = unsafe { automation.CreatePropertyCondition(UIA_RuntimeIdPropertyId, &value)? };
+    // The generated FindFirst wrapper maps a successful null result to an error;
+    // call the vtable to distinguish an absent element from an API failure.
+    let mut raw = ptr::null_mut();
+    unsafe {
+        (Interface::vtable(&root).FindFirst)(
+            Interface::as_raw(&root),
+            TreeScope_Descendants,
+            Interface::as_raw(&condition),
+            &mut raw,
+        )
+        .ok()?;
+    }
+    if raw.is_null() {
+        return Ok(RefocusOutcome::OriginalGone);
+    }
+    let original = unsafe { IUIAutomationElement::from_raw(raw) };
+    if unsafe { original.CurrentIsOffscreen()? }.as_bool() {
+        return Ok(RefocusOutcome::OriginalOffscreen);
+    }
+    if unsafe { GetForegroundWindow() } != target.foreground {
+        return Ok(RefocusOutcome::OtherWindow);
+    }
+    if focused_is_editable(&unsafe { automation.GetFocusedElement()? })? {
+        return Ok(RefocusOutcome::UserEditing);
+    }
+    if unsafe { GetForegroundWindow() } != target.foreground {
+        return Ok(RefocusOutcome::OtherWindow);
+    }
+    unsafe { original.SetFocus()? };
+    sleep(Duration::from_millis(50));
+    Ok(if target_is_current_inner(target) {
+        RefocusOutcome::Refocused
+    } else {
+        RefocusOutcome::RefocusFailed
+    })
+}
+
+fn focused_is_editable(element: &IUIAutomationElement) -> WindowsResult<bool> {
+    let control_type = unsafe { element.CurrentControlType()? };
+    if editable_control_type(control_type) {
+        return Ok(true);
+    }
+    // Chromium focuses its root web area (a Document) when the user clicks empty
+    // page space; a Document counts as an editor only with a writable value.
+    let available =
+        unsafe { element.GetCurrentPropertyValue(UIA_IsValuePatternAvailablePropertyId)? };
+    if !bool::try_from(&available)? {
+        return Ok(false);
+    }
+    let pattern: IUIAutomationValuePattern =
+        unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId)? };
+    Ok(!unsafe { pattern.CurrentIsReadOnly()? }.as_bool())
+}
+
+fn editable_control_type(control_type: UIA_CONTROLTYPE_ID) -> bool {
+    control_type == UIA_EditControlTypeId || control_type == UIA_ComboBoxControlTypeId
 }
 
 /// Text insertion strategy.
@@ -304,7 +431,7 @@ fn target_is_current_inner(target: &TargetSnapshot) -> bool {
 struct ComApartment;
 
 impl ComApartment {
-    fn initialize() -> Result<Self> {
+    fn initialize() -> WindowsResult<Self> {
         unsafe { OleInitialize(None)? };
         Ok(Self)
     }
@@ -987,6 +1114,15 @@ mod tests {
     use windows::Win32::System::Ole::{
         CF_BITMAP, CF_ENHMETAFILE, CF_LOCALE, CF_METAFILEPICT, CF_OEMTEXT, CF_PALETTE, CF_TEXT,
     };
+
+    #[test]
+    fn editable_control_types_include_standard_editors() {
+        use windows::Win32::UI::Accessibility::UIA_DocumentControlTypeId;
+        assert!(editable_control_type(UIA_EditControlTypeId));
+        assert!(editable_control_type(UIA_ComboBoxControlTypeId));
+        assert!(!editable_control_type(UIA_DocumentControlTypeId));
+        assert!(!editable_control_type(UIA_CONTROLTYPE_ID(50000)));
+    }
 
     #[test]
     fn snapshot_whitelist_only_allows_supported_hglobal_formats() {

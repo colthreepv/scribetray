@@ -75,7 +75,18 @@ pub(crate) fn complete_transcription(
             } else {
                 InsertMethod::Paste
             };
-            match wininput::insert_text(&target, &text, method, config.restore_clipboard) {
+            let mut refocus = None;
+            let mut result =
+                wininput::insert_text(&target, &text, method, config.restore_clipboard);
+            if matches!(result, Err(wininput::WinInputError::TargetChanged)) {
+                let outcome = wininput::refocus_original(&target);
+                if matches!(outcome, wininput::RefocusOutcome::Refocused) {
+                    result =
+                        wininput::insert_text(&target, &text, method, config.restore_clipboard);
+                }
+                refocus = Some(outcome);
+            }
+            match result {
                 Ok(()) => {
                     mark_history_delivery(history, history_id, true);
                     let _ = ui.send(UiCommand::SetTrayError(false));
@@ -92,7 +103,11 @@ pub(crate) fn complete_transcription(
                             info!("auto-enter sent after text insertion");
                         }
                     }
-                    info!("transcription inserted; method={method:?}");
+                    if refocus.is_some() {
+                        info!("transcription inserted after same-window refocus");
+                    } else {
+                        info!("transcription inserted; method={method:?}");
+                    }
                     if !recording_active {
                         let _ = ui.hide_caret_anchor();
                         *done_until = None;
@@ -100,12 +115,12 @@ pub(crate) fn complete_transcription(
                     play_cue(config.sounds, Cue::Normal);
                 }
                 Err(error) => {
-                    if matches!(error, wininput::WinInputError::TargetChanged) {
+                    if let Some(outcome) = refocus {
                         mark_history_delivery(history, history_id, false);
                         if let Err(copy_error) = wininput::copy_text(&text) {
                             warn!("could not copy pending transcript: {copy_error}");
                         }
-                        info!("focus moved; transcript copied and waiting for the original field");
+                        info!(refocus = ?outcome, "focus moved; transcript copied and waiting for the original field");
                         PENDING.set(Some(PendingDelivery {
                             target,
                             text,
