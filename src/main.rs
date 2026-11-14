@@ -5,6 +5,7 @@ compile_error!("Scribetray is a Windows-only desktop application");
 
 mod app_settings;
 mod audio;
+mod broadcast;
 mod autostart;
 mod config;
 mod delivery;
@@ -17,6 +18,7 @@ mod openai_streaming;
 mod realtime;
 mod scribe;
 mod silence;
+mod signal_stats;
 mod subscription;
 mod transcription;
 mod usage;
@@ -434,6 +436,102 @@ fn handle_ui_event(
     true
 }
 
+const LOG_RETENTION_DAYS: u64 = 7;
+
+/// Returns the newest suffix of a chronological log starting at the cutoff date.
+fn trim_log_text<'a>(log: &'a str, cutoff: &str) -> &'a str {
+    if !log.lines().any(|line| leading_timestamp(line).is_some()) {
+        return log;
+    }
+    let mut offset = 0;
+    for line in log.split_inclusive('\n') {
+        let Some(timestamp) = leading_timestamp(line) else {
+            offset += line.len();
+            continue;
+        };
+        if timestamp >= cutoff {
+            return &log[offset..];
+        }
+        offset += line.len();
+    }
+    ""
+}
+
+/// Trims the log before it is opened, preserving it if replacement fails.
+fn trim_log_file(path: &std::path::Path) {
+    let Some(cutoff) = utc_cutoff() else {
+        return;
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    let kept = trim_log_text(&contents, &cutoff);
+    if kept.len() == contents.len() {
+        return;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let temp_path = path.with_file_name(format!("{file_name}.trim-{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut temp = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+        std::io::Write::write_all(&mut temp, kept.as_bytes())?;
+        temp.sync_all()?;
+        drop(temp);
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn leading_timestamp(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes().get(..19)?;
+    let valid = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit());
+    valid.then(|| &line[..19])
+}
+
+fn utc_cutoff() -> Option<String> {
+    let retention_seconds = LOG_RETENTION_DAYS.checked_mul(86_400)?;
+    let cutoff =
+        std::time::SystemTime::now().checked_sub(Duration::from_secs(retention_seconds))?;
+    let seconds = cutoff.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let days = i64::try_from(seconds / 86_400).ok()?;
+    let time = seconds % 86_400;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        time / 3_600,
+        time % 3_600 / 60,
+        time % 60
+    ))
+}
+
 fn initialize_logging() {
     let Some(base_dirs) = BaseDirs::new() else {
         return;
@@ -442,6 +540,7 @@ fn initialize_logging() {
     if fs::create_dir_all(&log_directory).is_err() {
         return;
     }
+    trim_log_file(&log_directory.join("scribetray.log"));
     let file = match OpenOptions::new()
         .create(true)
         .append(true)
@@ -455,4 +554,34 @@ fn initialize_logging() {
         .with_ansi(false)
         .with_env_filter("info")
         .try_init();
+}
+
+#[cfg(test)]
+mod log_retention_tests {
+    use super::trim_log_text;
+
+    #[test]
+    fn keeps_entries_from_cutoff_with_their_continuations() {
+        let log = concat!(
+            "2026-11-06T23:59:59.999999Z old\n",
+            "  continuation of old\n",
+            "2026-11-07T00:00:00.000001Z new\n",
+            "  continuation of new\n",
+        );
+
+        assert_eq!(
+            trim_log_text(log, "2026-11-07T00:00:00"),
+            "2026-11-07T00:00:00.000001Z new\n  continuation of new\n"
+        );
+    }
+
+    #[test]
+    fn drops_an_all_old_log() {
+        let log = concat!(
+            "2026-11-06T23:59:59.999999Z old\n",
+            "  continuation of old\n",
+        );
+
+        assert!(trim_log_text(log, "2026-11-07T00:00:00").is_empty());
+    }
 }

@@ -4,6 +4,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    thread,
+    time::Duration,
 };
 
 use cpal::{
@@ -17,6 +19,10 @@ const FILTER_LEFT: i64 = 15;
 const FILTER_RIGHT: i64 = 16;
 const FILTER_RADIUS: f64 = 16.0;
 const INITIAL_RESERVE_SAMPLES: usize = OUTPUT_RATE as usize;
+const REALTIME_CHUNK_BYTES: usize = 3_200;
+const PROBE_MS: u64 = 150;
+const PROBE_ALIVE_DB: f32 = -80.0;
+const PROBE_FLOOR_DB: f32 = -120.0;
 
 /// How often the input callback folds accumulated energy into the envelope.
 const LEVEL_WINDOW_MS: u32 = 20;
@@ -32,6 +38,15 @@ const LEVEL_RELEASE: f32 = 0.15;
 pub struct Recording {
     pub pcm_16k_mono: Vec<u8>,
     pub duration_seconds: u32,
+}
+
+/// The selected input, its probe results, and any extra debug recording.
+pub struct PrioritizedCapture {
+    pub recorder: AudioRecorder,
+    pub receiver: Option<UnboundedReceiver<Vec<u8>>>,
+    pub probes: Vec<(String, f32)>,
+    pub used_default: bool,
+    pub raw: Option<(String, AudioRecorder)>,
 }
 
 /// A cheap, cloneable handle to a recorder's live output level.
@@ -81,6 +96,7 @@ pub enum AudioError {
 /// A live input stream. Dropping it cancels capture and releases the device.
 pub struct AudioRecorder {
     stream: Option<cpal::Stream>,
+    device_name: String,
     capture: Arc<Mutex<CaptureState>>,
     stream_error: Arc<StreamErrors>,
     limit_reached: Arc<AtomicBool>,
@@ -121,7 +137,7 @@ impl StreamErrors {
 impl AudioRecorder {
     /// Starts shared-mode capture from the named device, or the system default.
     pub fn start(device_name: Option<&str>, max_seconds: u32) -> Result<Self, AudioError> {
-        Self::start_with_stream(device_name, max_seconds, None)
+        Self::start_capture(device_name, max_seconds, false)
     }
 
     /// Starts capture and forwards resampled PCM in roughly 100 ms chunks.
@@ -129,15 +145,176 @@ impl AudioRecorder {
         device_name: Option<&str>,
         max_seconds: u32,
     ) -> Result<(Self, UnboundedReceiver<Vec<u8>>), AudioError> {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let recorder = Self::start_with_stream(device_name, max_seconds, Some(sender))?;
+        let recorder = Self::start(device_name, max_seconds)?;
+        let receiver = recorder.attach_realtime()?;
         Ok((recorder, receiver))
     }
 
-    fn start_with_stream(
+    /// Probes inputs in priority order, with the last input as an unconditional fallback.
+    pub fn start_prioritized(
+        candidates: &[String],
+        raw_device: Option<&str>,
+        max_seconds: u32,
+        realtime: bool,
+    ) -> Result<PrioritizedCapture, AudioError> {
+        if max_seconds == 0 {
+            return Err(AudioError::InvalidMaxSeconds);
+        }
+
+        let raw_device = raw_device.map(str::trim).filter(|name| !name.is_empty());
+        let (mut opened, mut raw) = thread::scope(|scope| {
+            let raw_worker = raw_device.map(|name| {
+                scope.spawn(move || {
+                    Self::start(Some(name), max_seconds)
+                        .inspect_err(|error| tracing::warn!(device = name, %error, "could not open debug microphone"))
+                        .ok()
+                })
+            });
+            let workers = candidates
+                .iter()
+                .map(|name| {
+                    scope.spawn(move || {
+                        Self::start_capture(Some(name), max_seconds, true)
+                            .inspect_err(|error| tracing::warn!(device = %name, %error, "could not open microphone candidate"))
+                            .ok()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let opened = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("microphone startup panicked"))
+                .collect::<Vec<_>>();
+            let raw = raw_worker
+                .and_then(|worker| worker.join().expect("debug microphone startup panicked"));
+            (opened, raw)
+        });
+
+        let named_fallback = opened.pop().flatten();
+        let using_default = named_fallback.is_none()
+            || candidates.last().is_some_and(|name| name.trim().is_empty());
+        let fallback = named_fallback.map_or_else(|| Self::start_probe_default(max_seconds), Ok);
+        let mut opened = opened.into_iter().flatten().collect::<Vec<_>>();
+
+        thread::sleep(Duration::from_millis(PROBE_MS));
+
+        let mut probes = Vec::new();
+        opened.retain(|recorder| match recorder.probe_db() {
+            Ok(db) => {
+                probes.push((recorder.device_name().to_owned(), db));
+                true
+            }
+            Err(error) => {
+                tracing::warn!(device = recorder.device_name(), %error, "microphone candidate failed during probe");
+                false
+            }
+        });
+        let fallback = fallback.and_then(|recorder| match recorder.probe_db() {
+            Ok(db) => Ok((recorder, db)),
+            Err(error) => {
+                tracing::warn!(device = recorder.device_name(), %error, "fallback microphone failed during probe");
+                Err(error)
+            }
+        });
+        let fallback = match fallback {
+            Ok((recorder, db)) => Some((recorder, db, using_default)),
+            Err(_error) if !using_default && !probes.iter().any(|(_, db)| *db > PROBE_ALIVE_DB) => {
+                match Self::start_probe_default(max_seconds) {
+                    Ok(recorder) => {
+                        thread::sleep(Duration::from_millis(PROBE_MS));
+                        match recorder.probe_db() {
+                            Ok(db) => Some((recorder, db, true)),
+                            Err(error) => {
+                                tracing::warn!(%error, "system default microphone failed during probe");
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(error) if opened.is_empty() => return Err(error),
+            Err(_) => None,
+        };
+        let mut rms_db: Vec<_> = probes.iter().map(|(_, db)| *db).collect();
+        let fallback_index = fallback.as_ref().map(|_| opened.len());
+        if let Some((recorder, db, _)) = fallback.as_ref() {
+            probes.push((recorder.device_name().to_owned(), *db));
+            rms_db.push(*db);
+        }
+        let selected =
+            select_working_probe(&rms_db, fallback_index).ok_or(AudioError::NoInputDevice)?;
+        let used_default = fallback
+            .as_ref()
+            .is_some_and(|(_, _, is_default)| fallback_index == Some(selected) && *is_default);
+        if let Some((recorder, _, _)) = fallback {
+            opened.push(recorder);
+        }
+        let recorder = opened.swap_remove(selected);
+        let device = recorder.device_name().to_owned();
+
+        if let Some(name) = raw_device {
+            if device.eq_ignore_ascii_case(name) {
+                raw = None;
+            } else if raw.is_none() {
+                raw = opened
+                    .iter()
+                    .position(|recorder| recorder.device_name().eq_ignore_ascii_case(name))
+                    .map(|index| opened.swap_remove(index));
+            }
+        }
+        drop(opened);
+        let receiver = realtime.then(|| recorder.attach_realtime()).transpose()?;
+        let raw = raw.and_then(|recorder| {
+            let name = recorder.device_name().to_owned();
+            if let Some(error) = lock_recover(&recorder.stream_error.fatal).as_ref() {
+                tracing::warn!(device = %name, %error, "debug microphone failed during probe");
+                return None;
+            }
+            Some((name, recorder))
+        });
+        Ok(PrioritizedCapture {
+            recorder,
+            receiver,
+            probes,
+            used_default,
+            raw,
+        })
+    }
+
+    fn start_probe_default(max_seconds: u32) -> Result<Self, AudioError> {
+        Self::start_capture(None, max_seconds, true).inspect_err(|error| {
+            tracing::warn!(%error, "could not open system default microphone for probe");
+        })
+    }
+
+    fn probe_db(&self) -> Result<f32, AudioError> {
+        if let Some(error) = lock_recover(&self.stream_error.fatal).as_ref() {
+            return Err(AudioError::Stream(error.clone()));
+        }
+        let capture = self
+            .capture
+            .lock()
+            .map_err(|_| AudioError::CaptureStatePoisoned)?;
+        Ok(capture
+            .probe
+            .as_ref()
+            .map_or(PROBE_FLOOR_DB, ProbeEnergy::db))
+    }
+
+    fn attach_realtime(&self) -> Result<UnboundedReceiver<Vec<u8>>, AudioError> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut capture = self
+            .capture
+            .lock()
+            .map_err(|_| AudioError::CaptureStatePoisoned)?;
+        capture.attach_realtime(sender);
+        Ok(receiver)
+    }
+
+    fn start_capture(
         device_name: Option<&str>,
         max_seconds: u32,
-        realtime_sender: Option<UnboundedSender<Vec<u8>>>,
+        probe: bool,
     ) -> Result<Self, AudioError> {
         if max_seconds == 0 {
             return Err(AudioError::InvalidMaxSeconds);
@@ -150,6 +327,7 @@ impl AudioRecorder {
                 .default_input_device()
                 .ok_or(AudioError::NoInputDevice)?,
         };
+        let device_name = input_device_name(&device);
 
         let (config, unsupported_format) = select_input_config(&device)?;
         let sample_rate = config.sample_rate();
@@ -174,7 +352,7 @@ impl AudioRecorder {
             max_input_frames,
             max_output_samples,
             max_output_bytes,
-            realtime_sender,
+            probe,
             level.clone(),
         )));
         let stream_error = Arc::new(StreamErrors::default());
@@ -276,6 +454,7 @@ impl AudioRecorder {
 
         Ok(Self {
             stream: Some(stream),
+            device_name,
             capture,
             stream_error,
             limit_reached,
@@ -354,18 +533,17 @@ impl AudioRecorder {
         }
     }
 
+    /// Returns the resolved name of the opened input device.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     /// Returns the available input device names for the tray microphone menu.
     pub fn input_device_names() -> Result<Vec<String>, AudioError> {
         let host = cpal::default_host();
         let mut names = host
             .input_devices()?
-            .map(|device| {
-                device
-                    .description()
-                    .ok()
-                    .map(|description| description.name().to_owned())
-                    .unwrap_or_else(|| device.to_string())
-            })
+            .map(|device| input_device_name(&device))
             .filter(|name| !name.trim().is_empty())
             .collect::<Vec<_>>();
         names.sort_by_key(|name| name.to_lowercase());
@@ -383,14 +561,38 @@ impl Drop for AudioRecorder {
     }
 }
 
+fn select_probe(rms_db: &[f32]) -> Option<usize> {
+    let (_, higher_priority) = rms_db.split_last()?;
+    Some(
+        higher_priority
+            .iter()
+            .position(|&db| db > PROBE_ALIVE_DB)
+            .unwrap_or(higher_priority.len()),
+    )
+}
+
+fn select_working_probe(rms_db: &[f32], fallback_index: Option<usize>) -> Option<usize> {
+    match fallback_index {
+        Some(_) => select_probe(rms_db),
+        None => rms_db
+            .iter()
+            .position(|&db| db > PROBE_ALIVE_DB)
+            .or_else(|| (!rms_db.is_empty()).then_some(0)),
+    }
+}
+
+fn input_device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .ok()
+        .map(|description| description.name().to_owned())
+        .unwrap_or_else(|| device.to_string())
+}
+
 fn find_input_device(host: &cpal::Host, requested_name: &str) -> Result<cpal::Device, AudioError> {
     let mut case_insensitive_match = None;
     for device in host.input_devices()? {
-        let name = device
-            .description()
-            .ok()
-            .map(|description| description.name().to_owned())
-            .unwrap_or_else(|| device.to_string());
+        let name = input_device_name(&device);
         if name == requested_name {
             return Ok(device);
         }
@@ -491,11 +693,32 @@ struct CaptureState {
     input_count: u64,
     output_samples: usize,
     pcm: Vec<u8>,
+    probe: Option<ProbeEnergy>,
     level: Arc<AtomicU32>,
     level_window_frames: u64,
     level_square_sum: f64,
     level_frames: u64,
     level_envelope: f32,
+}
+
+struct ProbeEnergy {
+    max_frames: u64,
+    frames: u64,
+    square_sum: f64,
+}
+
+impl ProbeEnergy {
+    fn db(&self) -> f32 {
+        if self.frames == 0 {
+            return PROBE_FLOOR_DB;
+        }
+        let db = (10.0 * (self.square_sum / self.frames as f64).log10()) as f32;
+        if db.is_finite() {
+            db.max(PROBE_FLOOR_DB)
+        } else {
+            PROBE_FLOOR_DB
+        }
+    }
 }
 
 impl CaptureState {
@@ -505,7 +728,7 @@ impl CaptureState {
         max_input_frames: u64,
         max_output_samples: u64,
         max_output_bytes: usize,
-        realtime_sender: Option<UnboundedSender<Vec<u8>>>,
+        probe: bool,
         level: Arc<AtomicU32>,
     ) -> Self {
         let max_output_samples = max_output_samples as usize;
@@ -517,19 +740,33 @@ impl CaptureState {
             max_input_frames,
             max_output_samples,
             max_output_bytes,
-            realtime_sender,
-            realtime_chunk: Vec::with_capacity(3_200),
+            realtime_sender: None,
+            realtime_chunk: Vec::new(),
             input: VecDeque::with_capacity(64),
             input_base: 0,
             input_count: 0,
             output_samples: 0,
             pcm: Vec::with_capacity(max_output_bytes.min(INITIAL_RESERVE_SAMPLES * 2)),
+            probe: probe.then(|| ProbeEnergy {
+                max_frames: (u64::from(sample_rate) * PROBE_MS).div_ceil(1_000),
+                frames: 0,
+                square_sum: 0.0,
+            }),
             level,
             level_window_frames,
             level_square_sum: 0.0,
             level_frames: 0,
             level_envelope: 0.0,
         }
+    }
+
+    fn attach_realtime(&mut self, sender: UnboundedSender<Vec<u8>>) {
+        debug_assert!(self.realtime_sender.is_none());
+        for chunk in self.pcm.chunks(REALTIME_CHUNK_BYTES) {
+            let _ = sender.send(chunk.to_vec());
+        }
+        self.realtime_chunk = Vec::with_capacity(REALTIME_CHUNK_BYTES);
+        self.realtime_sender = Some(sender);
     }
 
     fn push_samples<T>(&mut self, samples: &[T]) -> bool
@@ -544,17 +781,26 @@ impl CaptureState {
                 return true;
             }
 
-            let sum = frame
-                .iter()
-                .map(|sample| {
-                    let value: f32 = (*sample).to_sample();
-                    if value.is_finite() {
-                        f64::from(value)
-                    } else {
-                        0.0
+            let probe = self
+                .probe
+                .as_mut()
+                .filter(|probe| probe.frames < probe.max_frames);
+            let mut sum = 0.0;
+            let mut square_sum = 0.0;
+            for sample in frame {
+                let value: f32 = (*sample).to_sample();
+                if value.is_finite() {
+                    let value = f64::from(value);
+                    sum += value;
+                    if probe.is_some() {
+                        square_sum += value * value;
                     }
-                })
-                .sum::<f64>();
+                }
+            }
+            if let Some(probe) = probe {
+                probe.square_sum += square_sum / self.channels as f64;
+                probe.frames += 1;
+            }
             let mono = (sum / self.channels as f64).clamp(-1.0, 1.0) as f32;
             self.input.push_back(mono);
             self.input_count += 1;
@@ -641,9 +887,11 @@ impl CaptureState {
             self.pcm.extend_from_slice(&pcm_sample);
             if let Some(sender) = &self.realtime_sender {
                 self.realtime_chunk.extend_from_slice(&pcm_sample);
-                if self.realtime_chunk.len() >= 3_200 {
-                    let chunk =
-                        std::mem::replace(&mut self.realtime_chunk, Vec::with_capacity(3_200));
+                if self.realtime_chunk.len() >= REALTIME_CHUNK_BYTES {
+                    let chunk = std::mem::replace(
+                        &mut self.realtime_chunk,
+                        Vec::with_capacity(REALTIME_CHUNK_BYTES),
+                    );
                     let _ = sender.send(chunk);
                 }
             }
@@ -724,4 +972,87 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_picks_first_alive_input_or_unconditional_fallback() {
+        assert_eq!(select_probe(&[-96.0, -58.0, -40.0, -100.0]), Some(1));
+        assert_eq!(select_probe(&[-60.0, -50.0, -40.0]), Some(0));
+        assert_eq!(select_probe(&[-96.0, PROBE_ALIVE_DB, -105.0]), Some(2));
+        assert_eq!(select_probe(&[PROBE_FLOOR_DB]), Some(0));
+        assert_eq!(select_working_probe(&[-100.0, -90.0], None), Some(0));
+        assert_eq!(select_working_probe(&[-100.0, -60.0], None), Some(1));
+        assert_eq!(select_working_probe(&[], None), None);
+        assert_eq!(select_probe(&[]), None);
+    }
+
+    #[test]
+    fn probe_silence_has_finite_floor() {
+        let mut capture = capture_state(1, true);
+        assert_eq!(capture.probe.as_ref().unwrap().db(), PROBE_FLOOR_DB);
+        capture.push_samples(&[0.0_f32; 10]);
+        assert_eq!(capture.probe.as_ref().unwrap().db(), PROBE_FLOOR_DB);
+        capture.probe.as_mut().unwrap().square_sum = 1e-30;
+        assert_eq!(capture.probe.as_ref().unwrap().db(), PROBE_FLOOR_DB);
+    }
+
+    #[test]
+    fn probe_measures_raw_samples_before_downmix_and_caps_window() {
+        for (amplitude, expected_db) in [(0.000_015_85_f32, -96.0), (0.001, -60.0)] {
+            let mut capture = capture_state(2, true);
+            let window_frames = (u64::from(OUTPUT_RATE) * PROBE_MS / 1_000) as usize;
+            let mut samples = [amplitude, -amplitude].repeat(window_frames);
+            samples.extend_from_slice(&[1.0, 1.0]);
+            assert!(!capture.push_samples(&samples));
+            let db = capture.probe.as_ref().unwrap().db();
+            assert!((db - expected_db).abs() < 0.01, "got {db} dBFS");
+        }
+    }
+
+    #[test]
+    fn realtime_handover_sends_buffer_then_live_without_gaps_or_duplicates() {
+        let mut capture = capture_state(1, true);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let samples: Vec<i16> = (0..6_000).map(|i| (i * 13 % 20_000) as i16).collect();
+        let split = 2_400;
+        assert!(!capture.push_samples(&samples[..split]));
+        let prefix = capture.pcm.clone();
+        assert!(prefix.len() > REALTIME_CHUNK_BYTES);
+        capture.attach_realtime(sender);
+
+        let mut received = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            received.extend(chunk);
+        }
+        assert_eq!(received, prefix);
+
+        assert!(!capture.push_samples(&samples[split..]));
+        let live = receiver.try_recv().unwrap();
+        assert_eq!(live.len(), REALTIME_CHUNK_BYTES);
+        received.extend(live);
+        capture.finish();
+        drop(capture.realtime_sender.take());
+        while let Ok(chunk) = receiver.try_recv() {
+            received.extend(chunk);
+        }
+        assert_eq!(received, capture.pcm);
+        assert_eq!(received.len(), samples.len() * 2);
+    }
+
+    fn capture_state(channels: u16, probe: bool) -> CaptureState {
+        let frames = u64::from(OUTPUT_RATE);
+        CaptureState::new(
+            OUTPUT_RATE,
+            channels,
+            frames,
+            frames,
+            frames as usize * 2,
+            probe,
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
 }

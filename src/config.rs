@@ -104,6 +104,13 @@ pub struct Config {
     pub scribe_credits_per_hour: u32,
     /// Selected input device name, or `None` for the system default.
     pub microphone: Option<String>,
+    /// Devices probed at recording start, in priority order. The first one
+    /// carrying signal wins; the last is the unconditional fallback. When
+    /// empty, `microphone` is used.
+    pub microphone_priority: Vec<String>,
+    /// Debug: also record this device in parallel and keep its audio beside
+    /// the history entry, for example the hardware source behind a virtual mic.
+    pub debug_raw_capture: Option<String>,
     pub sounds: Sounds,
     pub start_with_windows: bool,
 }
@@ -131,6 +138,8 @@ impl fmt::Debug for Config {
             .field("max_seconds", &self.max_seconds)
             .field("scribe_credits_per_hour", &self.scribe_credits_per_hour)
             .field("microphone", &self.microphone)
+            .field("microphone_priority", &self.microphone_priority)
+            .field("debug_raw_capture", &self.debug_raw_capture)
             .field("sounds", &self.sounds)
             .field("start_with_windows", &self.start_with_windows)
             .finish()
@@ -159,6 +168,8 @@ impl Default for Config {
             max_seconds: 600,
             scribe_credits_per_hour: 585,
             microphone: None,
+            microphone_priority: Vec::new(),
+            debug_raw_capture: None,
             sounds: Sounds::Important,
             start_with_windows: false,
         }
@@ -328,7 +339,8 @@ mod sound_tests {
     #[test]
     fn legacy_sounds_migrate_and_are_dropped_on_save() {
         for (legacy, expected) in [(true, Sounds::All), (false, Sounds::Off)] {
-            let config = parse_config(&format!("sound_cues = {legacy}\npending_sound = true")).unwrap();
+            let config =
+                parse_config(&format!("sound_cues = {legacy}\npending_sound = true")).unwrap();
             assert_eq!(config.sounds, expected);
             let saved = toml::to_string(&config).unwrap();
             assert!(!saved.contains("sound_cues"));
@@ -340,8 +352,15 @@ mod sound_tests {
     #[test]
     fn sounds_parse_default_override_and_invalid_values() {
         assert_eq!(parse_config("").unwrap().sounds, Sounds::Important);
-        for (name, expected) in [("all", Sounds::All), ("important", Sounds::Important), ("off", Sounds::Off)] {
-            let config = parse_config(&format!("sounds = '{name}'\nsound_cues = false\npending_sound = false")).unwrap();
+        for (name, expected) in [
+            ("all", Sounds::All),
+            ("important", Sounds::Important),
+            ("off", Sounds::Off),
+        ] {
+            let config = parse_config(&format!(
+                "sounds = '{name}'\nsound_cues = false\npending_sound = false"
+            ))
+            .unwrap();
             assert_eq!(config.sounds, expected);
         }
         assert!(parse_config("sounds = 'invalid'").is_err());

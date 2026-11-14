@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "scribetray"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "cpal",

@@ -1,23 +1,30 @@
 use crate::app_settings::{
     format_duration, history_item_visible, history_preview, refresh_history_menu,
 };
-use crate::audio::AudioRecorder;
+use crate::audio::{AudioError, AudioRecorder};
+use crate::broadcast::{self, BroadcastSnapshot};
 use crate::config::{Config, Provider};
 use crate::delivery::{
     DONE_DISPLAY, Delivery, complete_transcription, discard_pending_delivery, set_anchor_error,
 };
 use crate::feedback::{Cue, play_cue, show_notice, ui_caret};
-use crate::history::{History, Recording, RecordingStatus};
+use crate::history::{History, RawCaptureInfo, Recording, RecordingMetadata, RecordingStatus};
 use crate::scribe::Transcription;
+use crate::signal_stats;
 use crate::windows_ui::{AnchorStatus, UiCommand, UiRuntime};
 use crate::wininput::{self, TargetSnapshot};
 use crate::{openai_streaming, realtime, transcription};
 use std::{
+    cell::Cell,
     collections::HashMap,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{error, info, warn};
 
 const CARET_REFRESH: Duration = Duration::from_millis(250);
@@ -28,6 +35,10 @@ const OPENAI_STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) struct WorkerFinished {
     history_id: String,
     result: Result<Transcription, String>,
+    /// "streaming", "fallback" or "batch".
+    mode: &'static str,
+    elapsed_ms: u64,
+    broadcast: Option<Receiver<Option<BroadcastSnapshot>>>,
 }
 
 /// Must outlive capture and finalization. An abandoned recording never flushes.
@@ -55,11 +66,104 @@ pub(crate) struct ActiveRecording {
     // Fields drop in declaration order: signal cancellation before closing audio.
     stream_cancel: Option<StreamCancellation>,
     pub(crate) recorder: AudioRecorder,
+    capture: CaptureDiagnostics,
     pub(crate) config: Config,
     stream_result: Option<Receiver<Result<Transcription, String>>>,
     target: TargetSnapshot,
     started: Instant,
     next_caret_refresh: Instant,
+}
+
+/// What was opened at hotkey time, kept for the history metadata.
+struct CaptureDiagnostics {
+    device: String,
+    device_is_default: bool,
+    probes: Vec<(String, f32)>,
+    raw: Option<(String, AudioRecorder)>,
+    broadcast: Option<Receiver<Option<BroadcastSnapshot>>>,
+}
+
+/// Recorder, streaming chunks when requested, and diagnostics.
+type OpenedCapture = (
+    AudioRecorder,
+    Option<UnboundedReceiver<Vec<u8>>>,
+    CaptureDiagnostics,
+);
+
+/// Opens the configured microphone, or probes `microphone_priority` when set.
+fn open_capture(config: &Config, stream: bool) -> Result<OpenedCapture, AudioError> {
+    let raw_device = config
+        .debug_raw_capture
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (recorder, chunks, probes, raw, device_is_default) = if config
+        .microphone_priority
+        .is_empty()
+        && raw_device.is_none()
+    {
+        let (recorder, chunks) = if stream {
+            let (recorder, chunks) =
+                AudioRecorder::start_realtime(config.microphone.as_deref(), config.max_seconds)?;
+            (recorder, Some(chunks))
+        } else {
+            (
+                AudioRecorder::start(config.microphone.as_deref(), config.max_seconds)?,
+                None,
+            )
+        };
+        (
+            recorder,
+            chunks,
+            Vec::new(),
+            None,
+            config
+                .microphone
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty()),
+        )
+    } else {
+        let candidates = if config.microphone_priority.is_empty() {
+            vec![config.microphone.clone().unwrap_or_default()]
+        } else {
+            config.microphone_priority.clone()
+        };
+        let capture =
+            AudioRecorder::start_prioritized(&candidates, raw_device, config.max_seconds, stream)?;
+        (
+            capture.recorder,
+            capture.receiver,
+            capture.probes,
+            capture.raw,
+            capture.used_default,
+        )
+    };
+    let device = recorder.device_name().to_owned();
+    // The snapshot is only meaningful when Broadcast is the recorded input.
+    let broadcast = device.contains("NVIDIA Broadcast").then(|| {
+        let (tx, rx) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("scribetray-broadcast".to_owned())
+            .spawn(move || {
+                let _ = tx.send(broadcast::snapshot());
+            });
+        rx
+    });
+    info!(
+        "microphone {device:?}; probes={probes:?}; raw={:?}",
+        raw.as_ref().map(|(name, _)| name)
+    );
+    Ok((
+        recorder,
+        chunks,
+        CaptureDiagnostics {
+            device,
+            device_is_default,
+            probes,
+            raw,
+            broadcast,
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,15 +269,15 @@ pub(crate) fn start_recording(
         }
     };
     let mut stream_cancel = None;
-    let (recorder, stream_result) = if config.provider == Provider::Openai {
-        let (recorder, audio_chunks) =
-            match AudioRecorder::start_realtime(config.microphone.as_deref(), config.max_seconds) {
-                Ok(started) => started,
-                Err(error) => {
-                    show_notice(ui, "Scribetray microphone", &error.to_string());
-                    return;
-                }
-            };
+    let (recorder, capture, stream_result) = if config.provider == Provider::Openai {
+        let (recorder, audio_chunks, capture) = match open_capture(config, true) {
+            Ok((recorder, Some(chunks), capture)) => (recorder, chunks, capture),
+            Ok(_) => unreachable!("streaming capture always returns audio chunks"),
+            Err(error) => {
+                show_notice(ui, "Scribetray microphone", &error.to_string());
+                return;
+            }
+        };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         stream_cancel = Some(StreamCancellation(Some(cancel_tx)));
         let (result_tx, result_rx) = mpsc::channel();
@@ -198,9 +302,9 @@ pub(crate) fn start_recording(
         if let Err(error) = task {
             warn!("Could not start OpenAI streaming ({error}); batch transcription will be used");
             stream_cancel.take();
-            (recorder, None)
+            (recorder, capture, None)
         } else {
-            (recorder, Some(result_rx))
+            (recorder, capture, Some(result_rx))
         }
     } else if config.provider == Provider::Elevenlabs
         && config.realtime
@@ -213,14 +317,14 @@ pub(crate) fn start_recording(
                 return;
             }
         };
-        let (recorder, audio_chunks) =
-            match AudioRecorder::start_realtime(config.microphone.as_deref(), config.max_seconds) {
-                Ok(started) => started,
-                Err(error) => {
-                    show_notice(ui, "Scribetray microphone", &error.to_string());
-                    return;
-                }
-            };
+        let (recorder, audio_chunks, capture) = match open_capture(config, true) {
+            Ok((recorder, Some(chunks), capture)) => (recorder, chunks, capture),
+            Ok(_) => unreachable!("streaming capture always returns audio chunks"),
+            Err(error) => {
+                show_notice(ui, "Scribetray microphone", &error.to_string());
+                return;
+            }
+        };
         let (result_tx, result_rx) = mpsc::channel();
         let language = language_for_api(&config.language);
         match thread::Builder::new()
@@ -242,7 +346,7 @@ pub(crate) fn start_recording(
                     });
                 let _ = result_tx.send(result);
             }) {
-            Ok(_) => (recorder, Some(result_rx)),
+            Ok(_) => (recorder, capture, Some(result_rx)),
             Err(error) => {
                 show_notice(
                     ui,
@@ -251,12 +355,12 @@ pub(crate) fn start_recording(
                         "Could not start the realtime connection; batch transcription will be used: {error}"
                     ),
                 );
-                (recorder, None)
+                (recorder, capture, None)
             }
         }
     } else {
-        match AudioRecorder::start(config.microphone.as_deref(), config.max_seconds) {
-            Ok(recorder) => (recorder, None),
+        match open_capture(config, false) {
+            Ok((recorder, _, capture)) => (recorder, capture, None),
             Err(error) => {
                 show_notice(ui, "Scribetray microphone", &error.to_string());
                 return;
@@ -278,6 +382,7 @@ pub(crate) fn start_recording(
     *active = Some(ActiveRecording {
         stream_cancel,
         recorder,
+        capture,
         config: config.clone(),
         stream_result,
         target,
@@ -302,6 +407,7 @@ pub(crate) fn stop_recording(
     deliveries: &mut HashMap<String, Delivery>,
     submit_after_transcription: &mut HashMap<String, bool>,
 ) {
+    let stopped_at = Instant::now();
     let Some(active_recording) = active.take() else {
         return;
     };
@@ -309,6 +415,7 @@ pub(crate) fn stop_recording(
     let stream_result = active_recording.stream_result;
     let mut stream_cancel = active_recording.stream_cancel;
     let recording_config = active_recording.config;
+    let mut capture = active_recording.capture;
     let enter_after = send_enter_after;
     let captured = if let Some(cancel) = stream_cancel.as_mut() {
         active_recording
@@ -335,6 +442,9 @@ pub(crate) fn stop_recording(
     play_cue(config.sounds, Cue::Normal);
     match history.create_pending_pcm(&captured.pcm_16k_mono, captured.duration_seconds) {
         Ok(recording) => {
+            let id = recording.id.clone();
+            let pcm = Arc::new(captured.pcm_16k_mono);
+            let broadcast = capture.broadcast.take();
             let anchor = target.caret.map(|caret| ui_caret(caret.rect));
             if let Some(rect) = anchor {
                 let _ = ui.update_caret_anchor(rect, AnchorStatus::Working);
@@ -342,7 +452,9 @@ pub(crate) fn stop_recording(
             if let Some(stream_result) = stream_result {
                 start_streaming_transcription(
                     recording,
-                    captured.pcm_16k_mono,
+                    Arc::clone(&pcm),
+                    stopped_at,
+                    broadcast,
                     stream_result,
                     stream_cancel.take(),
                     Delivery::Paste(target),
@@ -355,9 +467,11 @@ pub(crate) fn stop_recording(
                     submit_after_transcription,
                 );
             } else {
-                start_transcription(
+                start_batch_transcription(
                     recording,
-                    captured.pcm_16k_mono,
+                    Arc::clone(&pcm),
+                    stopped_at,
+                    broadcast,
                     Delivery::Paste(target),
                     enter_after,
                     &recording_config,
@@ -368,6 +482,8 @@ pub(crate) fn stop_recording(
                     submit_after_transcription,
                 );
             }
+            // Results are drained on this thread after the initial metadata is saved.
+            save_capture_metadata(history, &id, capture, &pcm, &recording_config);
         }
         Err(error) => {
             if let Some(cancel) = stream_cancel.as_mut() {
@@ -384,7 +500,9 @@ pub(crate) fn stop_recording(
 #[allow(clippy::too_many_arguments)]
 fn start_streaming_transcription(
     recording: Recording,
-    pcm: Vec<u8>,
+    pcm: Arc<Vec<u8>>,
+    started: Instant,
+    broadcast: Option<Receiver<Option<BroadcastSnapshot>>>,
     stream_result: Receiver<Result<Transcription, String>>,
     stream_cancel: Option<StreamCancellation>,
     delivery: Delivery,
@@ -419,14 +537,23 @@ fn start_streaming_transcription(
     let task = thread::Builder::new()
         .name("scribetray-transcription".to_owned())
         .spawn(move || {
+            let fell_back = Cell::new(false);
             let timeout =
                 (job_config.provider == Provider::Openai).then_some(OPENAI_STREAM_STOP_TIMEOUT);
             let result = finish_streaming(stream_result, stream_cancel, timeout, || {
+                fell_back.set(true);
                 transcription::transcribe(&job_config, &pcm, language.as_deref())
             });
             let _ = sender.send(WorkerFinished {
                 history_id: job_id,
                 result,
+                mode: if fell_back.get() {
+                    "fallback"
+                } else {
+                    "streaming"
+                },
+                elapsed_ms: elapsed_ms(started),
+                broadcast,
             });
         });
 
@@ -444,6 +571,81 @@ fn start_streaming_transcription(
         );
     }
     refresh_history_menu(ui, history);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Best-effort diagnostics written next to the recording; failures only warn.
+fn save_capture_metadata(
+    history: &History,
+    id: &str,
+    capture: CaptureDiagnostics,
+    pcm: &[u8],
+    config: &Config,
+) {
+    let signal = signal_stats::stats(pcm);
+    let raw_capture = capture
+        .raw
+        .and_then(|(device, recorder)| match recorder.stop() {
+            Ok(raw) => {
+                if let Err(error) = history.save_raw_pcm(id, &raw.pcm_16k_mono) {
+                    warn!("could not save raw capture of {device:?}: {error}");
+                }
+                Some(RawCaptureInfo {
+                    device,
+                    signal: signal_stats::stats(&raw.pcm_16k_mono),
+                })
+            }
+            Err(error) => {
+                warn!("raw capture of {device:?} failed: {error}");
+                None
+            }
+        });
+    info!(
+        "captured {:?}: peak={:.1} dB floor={:.1} dB speech={:.1} dB clipped={} leading_zero_ms={}",
+        capture.device,
+        signal.peak_db,
+        signal.floor_db,
+        signal.speech_db,
+        signal.clipped_samples,
+        signal.leading_zero_ms
+    );
+    let metadata = RecordingMetadata {
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        device: Some(capture.device),
+        device_is_default: capture.device_is_default,
+        probes: capture.probes,
+        signal: Some(signal),
+        provider: Some(format!("{:?}", config.provider).to_lowercase()),
+        transcription_mode: None,
+        stop_to_text_ms: None,
+        broadcast: None,
+        raw_capture,
+    };
+    if let Err(error) = history.set_metadata(id, metadata) {
+        warn!("could not save recording metadata: {error}");
+    }
+}
+
+fn record_outcome(history: &History, finished: &WorkerFinished) {
+    let id = &finished.history_id;
+    let Some(mut metadata) = history
+        .get(id)
+        .ok()
+        .and_then(|recording| recording.metadata)
+    else {
+        return;
+    };
+    metadata.transcription_mode = Some(finished.mode.to_owned());
+    metadata.stop_to_text_ms = Some(finished.elapsed_ms);
+    if let Some(Ok(Some(snapshot))) = finished.broadcast.as_ref().map(Receiver::try_recv) {
+        metadata.broadcast = Some(snapshot);
+    }
+    if let Err(error) = history.set_metadata(id, metadata) {
+        warn!("could not update recording metadata: {error}");
+    }
 }
 
 /// Called only after a successful stop and history write, never on cancellation.
@@ -503,6 +705,38 @@ pub(crate) fn start_transcription(
     deliveries: &mut HashMap<String, Delivery>,
     submit_after_transcription: &mut HashMap<String, bool>,
 ) {
+    let started = Instant::now();
+    start_batch_transcription(
+        recording,
+        Arc::new(pcm),
+        started,
+        None,
+        delivery,
+        enter_after,
+        config,
+        ui,
+        history,
+        worker_tx,
+        deliveries,
+        submit_after_transcription,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_batch_transcription(
+    recording: Recording,
+    pcm: Arc<Vec<u8>>,
+    started: Instant,
+    broadcast: Option<Receiver<Option<BroadcastSnapshot>>>,
+    delivery: Delivery,
+    enter_after: bool,
+    config: &Config,
+    ui: &UiRuntime,
+    history: &History,
+    worker_tx: &Sender<WorkerFinished>,
+    deliveries: &mut HashMap<String, Delivery>,
+    submit_after_transcription: &mut HashMap<String, bool>,
+) {
     let id = recording.id;
     if deliveries.contains_key(&id) {
         show_notice(
@@ -530,6 +764,9 @@ pub(crate) fn start_transcription(
             let _ = sender.send(WorkerFinished {
                 history_id: job_id,
                 result,
+                mode: "batch",
+                elapsed_ms: elapsed_ms(started),
+                broadcast,
             });
         });
 
@@ -564,6 +801,7 @@ pub(crate) fn drain_worker_events(
         let enter_after = submit_after_transcription
             .remove(&finished.history_id)
             .unwrap_or(false);
+        record_outcome(history, &finished);
 
         match finished.result {
             Ok(transcription) => {

@@ -9,8 +9,10 @@ use std::{
 };
 
 use directories::BaseDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+
+use crate::{broadcast::BroadcastSnapshot, signal_stats::SignalStats};
 
 const APP_DIRECTORY: &str = "Scribetray";
 const HISTORY_DIRECTORY: &str = "history";
@@ -30,8 +32,32 @@ pub enum RecordingStatus {
     Failed,
 }
 
+/// Optional capture and transcription diagnostics.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RecordingMetadata {
+    pub app_version: String,
+    pub device: Option<String>,
+    pub device_is_default: bool,
+    pub probes: Vec<(String, f32)>,
+    pub signal: Option<SignalStats>,
+    pub provider: Option<String>,
+    pub transcription_mode: Option<String>,
+    pub stop_to_text_ms: Option<u64>,
+    pub broadcast: Option<BroadcastSnapshot>,
+    pub raw_capture: Option<RawCaptureInfo>,
+}
+
+/// Diagnostics for the capture before processing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RawCaptureInfo {
+    pub device: String,
+    pub signal: SignalStats,
+}
+
 /// Public metadata contract for one 16 kHz mono recording.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Recording {
     /// Stable filename identifier, also accepted by the audio/read/update APIs.
     pub id: String,
@@ -51,6 +77,22 @@ pub struct Recording {
     pub detected_language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub metadata: Option<RecordingMetadata>,
+}
+
+fn deserialize_metadata<'de, D>(deserializer: D) -> Result<Option<RecordingMetadata>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Consume the entire optional block before checking its shape so bad
+    // diagnostics do not prevent the rest of the recording from loading.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// Filesystem-backed recording history.
@@ -108,6 +150,7 @@ impl History {
             transcript: None,
             detected_language: None,
             error: None,
+            metadata: None,
         };
 
         let audio_path = self.audio_path(&id)?;
@@ -216,11 +259,28 @@ impl History {
         Ok(recording)
     }
 
+    /// Updates the optional diagnostics for a recording.
+    pub fn set_metadata(&self, id: &str, metadata: RecordingMetadata) -> Result<(), HistoryError> {
+        let mut recording = self.get(id)?;
+        recording.metadata = Some(metadata);
+        self.write_recording(&recording)
+    }
+
+    /// Saves the original PCM capture alongside the recording.
+    pub fn save_raw_pcm(&self, id: &str, bytes: &[u8]) -> Result<(), HistoryError> {
+        if !bytes.len().is_multiple_of(BYTES_PER_SAMPLE) {
+            return Err(HistoryError::InvalidAudio);
+        }
+        self.get(id)?;
+        atomic_write(&self.raw_audio_path(id)?, bytes)
+    }
+
     /// Removes audio and metadata for all but the newest 20 recordings.
     pub fn prune(&self) -> Result<(), HistoryError> {
         let recordings = self.list()?;
         for recording in recordings.into_iter().skip(MAX_RECORDINGS) {
             remove_if_present(&self.audio_path(&recording.id)?)?;
+            remove_if_present(&self.raw_audio_path(&recording.id)?)?;
             remove_if_present(&self.metadata_path(&recording.id)?)?;
         }
         Ok(())
@@ -234,6 +294,11 @@ impl History {
     fn audio_path(&self, id: &str) -> Result<PathBuf, HistoryError> {
         validate_id(id)?;
         Ok(self.root.join(format!("{id}.pcm")))
+    }
+
+    fn raw_audio_path(&self, id: &str) -> Result<PathBuf, HistoryError> {
+        validate_id(id)?;
+        Ok(self.root.join(format!("{id}.raw.pcm")))
     }
 
     fn write_recording(&self, recording: &Recording) -> Result<(), HistoryError> {
@@ -309,4 +374,75 @@ pub enum HistoryError {
     InvalidId,
     #[error("recording audio is not signed 16-bit PCM")]
     InvalidAudio,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_recording_round_trips_without_metadata() {
+        let old = r#"{"id":"1","timestamp_ms":1,"duration_ms":0,"status":"pending"}"#;
+        let recording: Recording = serde_json::from_str(old).unwrap();
+        assert_eq!(recording.metadata, None);
+        let saved = serde_json::to_value(&recording).unwrap();
+        assert!(saved.get("metadata").is_none());
+        assert_eq!(
+            serde_json::from_value::<Recording>(saved).unwrap(),
+            recording
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_does_not_hide_recording() {
+        let json = r#"{"id":"1","timestamp_ms":1,"duration_ms":0,"status":"succeeded",
+            "metadata":{"probes":[["x",null]]},"transcript":"Hello"}"#;
+        let recording: Recording = serde_json::from_str(json).unwrap();
+        assert_eq!(recording.metadata, None);
+        assert_eq!(recording.status, RecordingStatus::Succeeded);
+        assert_eq!(recording.transcript.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn partial_metadata_uses_defaults() {
+        let metadata: RecordingMetadata =
+            serde_json::from_str(r#"{"raw_capture":{"device":"x"}}"#).unwrap();
+        assert_eq!(
+            metadata,
+            RecordingMetadata {
+                raw_capture: Some(RawCaptureInfo {
+                    device: "x".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_round_trips_and_prune_removes_raw() {
+        let root =
+            std::env::temp_dir().join(format!("scribetray-history-{}", uuid::Uuid::new_v4()));
+        let history = History::with_root(&root).unwrap();
+        let first = history.create_pending_pcm(&[0, 0], 0).unwrap();
+        let metadata = RecordingMetadata {
+            app_version: "test".into(),
+            ..Default::default()
+        };
+        history.set_metadata(&first.id, metadata.clone()).unwrap();
+        assert_eq!(history.get(&first.id).unwrap().metadata, Some(metadata));
+        history.save_raw_pcm(&first.id, &[1, 0]).unwrap();
+        assert!(history.raw_audio_path(&first.id).unwrap().exists());
+        // Ensure the first item is older even when all entries share a timestamp.
+        let mut old = history.get(&first.id).unwrap();
+        old.timestamp_ms = 0;
+        history.write_recording(&old).unwrap();
+        for _ in 0..MAX_RECORDINGS {
+            history.create_pending_pcm(&[0, 0], 0).unwrap();
+        }
+        assert!(!history.raw_audio_path(&first.id).unwrap().exists());
+        assert!(!history.audio_path(&first.id).unwrap().exists());
+        assert!(!history.metadata_path(&first.id).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
