@@ -186,12 +186,44 @@ fn refocus_original_inner(target: &TargetSnapshot, id: &[i32]) -> WindowsResult<
         return Ok(RefocusOutcome::OtherWindow);
     }
     unsafe { original.SetFocus()? };
-    sleep(Duration::from_millis(50));
-    Ok(if target_is_current_inner(target) {
-        RefocusOutcome::Refocused
-    } else {
-        RefocusOutcome::RefocusFailed
-    })
+    // Chromium can apply a UIA focus request a few frames late.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        sleep(Duration::from_millis(25));
+        if target_is_current_inner(target) {
+            return Ok(RefocusOutcome::Refocused);
+        }
+        if Instant::now() >= deadline {
+            info!(
+                expected = ?id,
+                focused = %describe_focus(),
+                "refocus did not land on the original field"
+            );
+            return Ok(RefocusOutcome::RefocusFailed);
+        }
+    }
+}
+
+/// One-line description of the focused UIA element, for failure diagnostics.
+pub fn describe_focus() -> String {
+    let Ok(_com) = ComApartment::initialize() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(element) = focused_uia_element() else {
+        return "unavailable".to_owned();
+    };
+    let control_type = unsafe { element.CurrentControlType() }
+        .map(|value| value.0)
+        .unwrap_or_default();
+    let name: String = unsafe { element.CurrentName() }
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let editable = focused_is_editable(&element).unwrap_or(false);
+    let id = runtime_id(&element).ok().flatten();
+    format!("type={control_type} editable={editable} name={name:?} runtime_id={id:?}")
 }
 
 fn focused_is_editable(element: &IUIAutomationElement) -> WindowsResult<bool> {

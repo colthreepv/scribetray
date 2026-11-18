@@ -112,6 +112,7 @@ pub(crate) fn make_ui_settings(
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
         intercept_enter: config.intercept_enter,
+        anchor_size: config.anchor_size,
         sounds: config.sounds,
         type_mode: config.insert_method.eq_ignore_ascii_case("type"),
         autostart_enabled: config.start_with_windows,

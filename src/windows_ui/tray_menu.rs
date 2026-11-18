@@ -606,6 +606,14 @@ fn build_tray_menu(
         UiEvent::ToggleAutostart,
         &mut actions,
     )?;
+    append_check_action(
+        root.0,
+        "Large anchor",
+        21,
+        settings.anchor_size == crate::config::AnchorSize::Large,
+        UiEvent::ToggleAnchorSize,
+        &mut actions,
+    )?;
     append_separator(root.0)?;
     append_flags(
         root.0,

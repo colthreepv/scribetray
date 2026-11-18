@@ -50,6 +50,8 @@ prefix_enabled = true
 auto_enter = false
 # Intercept plain Enter while recording; Shift+Enter always passes through.
 intercept_enter = true
+# Caret anchor size: "normal" or "large".
+anchor_size = "normal"
 # Insert transcripts by simulated typing or clipboard paste.
 insert_method = "type"
 restore_clipboard = true
@@ -96,6 +98,8 @@ pub struct Config {
     pub auto_enter: bool,
     /// Intercept plain Enter during recording; Shift+Enter passes through.
     pub intercept_enter: bool,
+    /// Caret anchor size.
+    pub anchor_size: AnchorSize,
     /// Transcript insertion strategy (for example, `paste` or `type`).
     pub insert_method: String,
     pub restore_clipboard: bool,
@@ -133,6 +137,7 @@ impl fmt::Debug for Config {
             .field("prefix_enabled", &self.prefix_enabled)
             .field("auto_enter", &self.auto_enter)
             .field("intercept_enter", &self.intercept_enter)
+            .field("anchor_size", &self.anchor_size)
             .field("insert_method", &self.insert_method)
             .field("restore_clipboard", &self.restore_clipboard)
             .field("max_seconds", &self.max_seconds)
@@ -163,6 +168,7 @@ impl Default for Config {
             prefix_enabled: true,
             auto_enter: false,
             intercept_enter: true,
+            anchor_size: AnchorSize::Normal,
             insert_method: "type".to_owned(),
             restore_clipboard: true,
             max_seconds: 600,
@@ -191,6 +197,14 @@ pub enum Sounds {
     #[default]
     Important,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnchorSize {
+    #[default]
+    Normal,
+    Large,
 }
 
 // Legacy keys are consumed when reading and omitted the next time settings are saved.
@@ -365,5 +379,25 @@ mod sound_tests {
         }
         assert!(parse_config("sounds = 'invalid'").is_err());
         assert!(parse_config("sounds = true").is_err());
+    }
+}
+
+#[cfg(test)]
+mod anchor_size_tests {
+    use super::*;
+
+    #[test]
+    fn missing_anchor_size_defaults_to_normal_and_large_roundtrips() {
+        assert_eq!(parse_config("").unwrap().anchor_size, AnchorSize::Normal);
+
+        let config = parse_config("anchor_size = 'large'").unwrap();
+        assert_eq!(config.anchor_size, AnchorSize::Large);
+        assert_eq!(
+            parse_config(&toml::to_string(&config).unwrap())
+                .unwrap()
+                .anchor_size,
+            AnchorSize::Large
+        );
+        assert!(parse_config("anchor_size = 'huge'").is_err());
     }
 }

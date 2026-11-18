@@ -349,6 +349,14 @@ fn handle_ui_event(
             config.intercept_enter = !config.intercept_enter;
             save_config(config, ui);
         }
+        UiEvent::ToggleAnchorSize => {
+            config.anchor_size = if config.anchor_size == crate::config::AnchorSize::Large {
+                crate::config::AnchorSize::Normal
+            } else {
+                crate::config::AnchorSize::Large
+            };
+            save_config(config, ui);
+        }
         UiEvent::SoundsSelected(sounds) => {
             config.sounds = sounds;
             save_config(config, ui);

@@ -1,9 +1,6 @@
 use super::overlay::{
-    OVERLAY_BAR_MAX_DIP, OVERLAY_BAR_MIN_DIP, OVERLAY_BAR_PITCH_DIP, OVERLAY_BAR_START_DIP,
-    OVERLAY_BAR_WIDTH_DIP, OVERLAY_DOT_RADIUS_DIP, OVERLAY_DOT_X_DIP, OVERLAY_ERROR_FADE_SECONDS,
-    OVERLAY_ERROR_HOLD_SECONDS, OVERLAY_FADE_IN_SECONDS, OVERLAY_SHADOW_PAD_DIP, OVERLAY_WAVE_BARS,
-    OverlayKind, PILL_COUNTDOWN_WIDTH_DIP, PILL_HEIGHT_DIP, PILL_RADIUS_DIP, PILL_WIDTH_DIP,
-    overlay_countdown, overlay_kind,
+    OVERLAY_ERROR_FADE_SECONDS, OVERLAY_ERROR_HOLD_SECONDS, OVERLAY_FADE_IN_SECONDS,
+    OVERLAY_WAVE_BARS, OverlayGeometry, OverlayKind, overlay_countdown, overlay_kind,
 };
 use super::state::UiState;
 use super::types::AnchorStatus;
@@ -38,21 +35,54 @@ const CIRCLE_KAPPA: f32 = 0.552_284_75;
 /// The geometry is written in device-independent pixels and multiplied by the
 /// monitor scale factor.
 pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
-    let pad = OVERLAY_SHADOW_PAD_DIP * scale;
-    let countdown = overlay_countdown(state);
-    let pill_width = if countdown.is_some() {
-        PILL_COUNTDOWN_WIDTH_DIP * scale
-    } else {
-        PILL_WIDTH_DIP * scale
+    let frame = OverlayFrame {
+        status: state.anchor_status,
+        countdown: overlay_countdown(state),
+        since_show: state.overlay_shown_at.elapsed().as_secs_f32(),
+        state_seconds: state.overlay_state_since.elapsed().as_secs_f32(),
+        shown: state.overlay_shown,
+        close_visible: state.overlay_close_visible(),
+        close_hot: state.overlay_close_hot(),
+        push_to_talk: state.settings.push_to_talk,
     };
-    let pill_height = PILL_HEIGHT_DIP * scale;
-    let radius = PILL_RADIUS_DIP * scale;
-    let center_y = pad + pill_height / 2.0;
+    draw_overlay_frame(pixmap, &frame, state.overlay_geometry(), scale);
+}
 
-    let since_show = state.overlay_shown_at.elapsed().as_secs_f32();
-    let mut alpha = (since_show / OVERLAY_FADE_IN_SECONDS).clamp(0.0, 1.0);
-    let kind = state.anchor_status.map(overlay_kind);
-    let state_seconds = state.overlay_state_since.elapsed().as_secs_f32();
+/// A render-only snapshot, also used by previews without creating UI windows.
+struct OverlayFrame {
+    status: Option<AnchorStatus>,
+    countdown: Option<u32>,
+    since_show: f32,
+    state_seconds: f32,
+    shown: [f32; OVERLAY_WAVE_BARS],
+    close_visible: bool,
+    close_hot: bool,
+    push_to_talk: bool,
+}
+
+fn draw_overlay_frame(
+    pixmap: &mut Pixmap,
+    frame: &OverlayFrame,
+    geometry: OverlayGeometry,
+    scale: f32,
+) {
+    // Completion hides the overlay; a frame without a status is transparent.
+    let Some(status) = frame.status else {
+        return;
+    };
+    let pad = geometry.shadow_pad * scale;
+    let countdown = frame.countdown;
+    let pill_width = if countdown.is_some() {
+        geometry.countdown_width
+    } else {
+        geometry.width
+    } * scale;
+    let pill_height = geometry.height * scale;
+    let radius = pill_height / 2.0;
+    let center_y = pad + pill_height / 2.0;
+    let mut alpha = (frame.since_show / OVERLAY_FADE_IN_SECONDS).clamp(0.0, 1.0);
+    let kind = Some(overlay_kind(status));
+    let state_seconds = frame.state_seconds;
     if kind == Some(OverlayKind::Error) {
         alpha *= error_fade(state_seconds);
     }
@@ -63,7 +93,7 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
 
     let shadow_offset = 2.0 * scale;
     if kind == Some(OverlayKind::Error) {
-        // Error collapses to a 22x22 circle with a red cross.
+        // Error collapses to a circle matching the selected pill height.
         let compact_radius = pill_height / 2.0;
         let center_x = pad + compact_radius;
         for step in 1..=3 {
@@ -80,7 +110,7 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
         if let Some(path) = circle_path(center_x, center_y, compact_radius - 0.5 * scale) {
             stroke_path(pixmap, &path, pill_border(alpha), scale);
         }
-        let reach = 3.5 * scale;
+        let reach = geometry.error_reach * scale;
         let color = record_color(alpha);
         if let Some(path) = line_path(
             center_x - reach,
@@ -88,7 +118,7 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
             center_x + reach,
             center_y + reach,
         ) {
-            stroke_path(pixmap, &path, color, 2.0 * scale);
+            stroke_path(pixmap, &path, color, geometry.error_stroke * scale);
         }
         if let Some(path) = line_path(
             center_x - reach,
@@ -96,7 +126,7 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
             center_x + reach,
             center_y - reach,
         ) {
-            stroke_path(pixmap, &path, color, 2.0 * scale);
+            stroke_path(pixmap, &path, color, geometry.error_stroke * scale);
         }
         return;
     }
@@ -130,22 +160,22 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
 
     match kind {
         Some(OverlayKind::Recording) => {
-            let elapsed = match state.anchor_status {
+            let elapsed = match frame.status {
                 Some(AnchorStatus::Recording { elapsed }) => elapsed.as_secs_f32(),
                 _ => state_seconds,
             };
             let pulse =
                 0.55 + 0.45 * (0.5 + 0.5 * (2.0 * std::f32::consts::PI * elapsed / 1.6).cos());
-            let dot_x = pad + OVERLAY_DOT_X_DIP * scale;
-            let dot_radius = OVERLAY_DOT_RADIUS_DIP * scale;
+            let dot_x = pad + geometry.dot_x * scale;
+            let dot_radius = geometry.dot_radius * scale;
             let dot_color = record_color(alpha * pulse);
-            if state.overlay_close_visible() {
-                let hot = state.overlay_close_hot();
-                if let Some(path) = circle_path(dot_x, center_y, 8.0 * scale) {
+            if frame.close_visible {
+                let hot = frame.close_hot;
+                if let Some(path) = circle_path(dot_x, center_y, geometry.close_radius * scale) {
                     let fill = if hot { 72.0 } else { 40.0 };
                     fill_path(pixmap, &path, rgba8(255, 255, 255, (fill * alpha) as u8));
                 }
-                let reach = 3.0 * scale;
+                let reach = geometry.close_reach * scale;
                 for direction in [-1.0, 1.0] {
                     if let Some(path) = line_path(
                         dot_x - reach,
@@ -154,45 +184,48 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
                         center_y + direction * reach,
                     ) {
                         let ink = if hot { 1.0 } else { 0.85 };
-                        stroke_path(pixmap, &path, bar_color(alpha * ink), 1.5 * scale);
+                        stroke_path(
+                            pixmap,
+                            &path,
+                            bar_color(alpha * ink),
+                            geometry.close_stroke * scale,
+                        );
                     }
                 }
-            } else if state.settings.push_to_talk {
+            } else if frame.push_to_talk {
                 if let Some(path) = circle_path(dot_x, center_y, dot_radius) {
-                    stroke_path(pixmap, &path, dot_color, 1.5 * scale);
+                    stroke_path(pixmap, &path, dot_color, geometry.close_stroke * scale);
                 }
             } else if let Some(path) = circle_path(dot_x, center_y, dot_radius) {
                 fill_path(pixmap, &path, dot_color);
             }
-            let bar_width = OVERLAY_BAR_WIDTH_DIP * scale;
-            for index in 0..OVERLAY_WAVE_BARS {
-                let level = state.overlay_shown[index].clamp(0.0, 1.0);
-                let bar_height = (OVERLAY_BAR_MIN_DIP
-                    + level * (OVERLAY_BAR_MAX_DIP - OVERLAY_BAR_MIN_DIP))
-                    * scale;
-                let x =
-                    pad + (OVERLAY_BAR_START_DIP + index as f32 * OVERLAY_BAR_PITCH_DIP) * scale;
+            let bar_width = geometry.bar_width * scale;
+            for index in 0..geometry.bars {
+                let level = frame.shown[index].clamp(0.0, 1.0);
+                let bar_height =
+                    (geometry.bar_min + level * (geometry.bar_max - geometry.bar_min)) * scale;
+                let x = pad + (geometry.bar_start + index as f32 * geometry.bar_pitch) * scale;
                 let y = center_y - bar_height / 2.0;
                 if let Some(path) = round_rect_path(x, y, bar_width, bar_height, bar_width / 2.0) {
                     fill_path(pixmap, &path, bar_color(alpha));
                 }
             }
             if let Some(remaining) = countdown {
-                draw_countdown(pixmap, remaining, pad, pill_width, center_y, scale, alpha);
+                draw_countdown(pixmap, remaining, geometry, scale, alpha);
             }
         }
         Some(OverlayKind::Working) => {
-            let dot_x = pad + OVERLAY_DOT_X_DIP * scale;
-            if let Some(path) = circle_path(dot_x, center_y, OVERLAY_DOT_RADIUS_DIP * scale) {
+            let dot_x = pad + geometry.dot_x * scale;
+            if let Some(path) = circle_path(dot_x, center_y, geometry.dot_radius * scale) {
                 fill_path(pixmap, &path, work_color(alpha));
             }
             let period = state_seconds / 0.9;
             for index in 0..3 {
                 let phase = 2.0 * std::f32::consts::PI * (period - index as f32 / 6.0);
-                let offset = 3.0 * phase.sin().max(0.0);
-                let x = pad + (27.0 + index as f32 * 6.0) * scale;
+                let offset = geometry.work_bounce * phase.sin().max(0.0);
+                let x = pad + (geometry.work_start + index as f32 * geometry.work_pitch) * scale;
                 let y = center_y - offset * scale;
-                if let Some(path) = circle_path(x, y, 1.75 * scale) {
+                if let Some(path) = circle_path(x, y, geometry.work_radius * scale) {
                     fill_path(pixmap, &path, bar_color(alpha));
                 }
             }
@@ -204,12 +237,13 @@ pub(super) fn draw_overlay(pixmap: &mut Pixmap, state: &UiState, scale: f32) {
 fn draw_countdown(
     pixmap: &mut Pixmap,
     remaining: u32,
-    pad: f32,
-    pill_width: f32,
-    center_y: f32,
+    geometry: OverlayGeometry,
     scale: f32,
     alpha: f32,
 ) {
+    let pad = geometry.shadow_pad * scale;
+    let pill_width = geometry.countdown_width * scale;
+    let center_y = pad + geometry.height * scale / 2.0;
     let text = format!("{}:{:02}", remaining / 60, remaining % 60);
     let width = match i32::try_from(pixmap.width()) {
         Ok(width) => width,
@@ -271,7 +305,7 @@ fn draw_countdown(
         return;
     }
 
-    let font_height = (11.0 * scale).round().max(1.0) as i32;
+    let font_height = (geometry.countdown_font * scale).round().max(1.0) as i32;
     let Some((font, previous_font)) = select_overlay_countdown_font(dc, font_height) else {
         unsafe {
             let _ = SelectObject(dc, previous_bitmap);
@@ -294,7 +328,7 @@ fn draw_countdown(
             && GetTextMetricsW(dc, &mut metrics).as_bool()
     };
     if measured {
-        let right = pad + pill_width - 10.0 * scale;
+        let right = pad + pill_width - geometry.countdown_inset * scale;
         let x = (right - extent.cx as f32).round() as i32;
         let y = (center_y - metrics.tmHeight as f32 / 2.0).round() as i32;
         unsafe {
@@ -677,4 +711,67 @@ pub(super) fn present_layered_window(hwnd: HWND, pixmap: &Pixmap) -> Result<(), 
         let _ = ReleaseDC(None, screen_dc);
     }
     result.map_err(|error| format!("UpdateLayeredWindow failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::overlay::{overlay_window_height, overlay_window_width};
+    use super::*;
+    use crate::config::AnchorSize;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "writes render previews into the temporary directory"]
+    fn render_anchor_previews() {
+        let directory = std::env::temp_dir().join("scribetray-anchor-preview");
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, size) in [("normal", AnchorSize::Normal), ("large", AnchorSize::Large)] {
+            let geometry = OverlayGeometry::for_size(size);
+            for scale in [1.0, 2.0] {
+                for variant in [
+                    "recording",
+                    "countdown",
+                    "hover",
+                    "working",
+                    "error",
+                    "done",
+                ] {
+                    let frame = OverlayFrame {
+                        status: match variant {
+                            "working" => Some(AnchorStatus::Working),
+                            "error" => Some(AnchorStatus::Error),
+                            "done" => None,
+                            _ => Some(AnchorStatus::Recording {
+                                elapsed: Duration::from_secs(8),
+                            }),
+                        },
+                        countdown: (variant == "countdown").then_some(42),
+                        since_show: 1.0,
+                        state_seconds: 0.25,
+                        shown: std::array::from_fn(|index| {
+                            let position = index as f32 / (geometry.bars - 1) as f32;
+                            0.1 + 0.9 * (position * std::f32::consts::PI * 2.0).sin().abs()
+                        }),
+                        close_visible: variant == "hover",
+                        close_hot: variant == "hover",
+                        push_to_talk: false,
+                    };
+                    let mut pixmap = Pixmap::new(
+                        overlay_window_width(scale, frame.countdown.is_some(), geometry) as u32,
+                        overlay_window_height(scale, geometry) as u32,
+                    )
+                    .unwrap();
+                    draw_overlay_frame(&mut pixmap, &frame, geometry, scale);
+                    if variant == "done" {
+                        assert!(pixmap.data().iter().all(|byte| *byte == 0));
+                    } else {
+                        assert!(pixmap.data().chunks_exact(4).any(|pixel| pixel[3] > 0));
+                    }
+                    let path = directory.join(format!("{name}-{variant}-{}x.png", scale as u32));
+                    pixmap.save_png(&path).unwrap();
+                    println!("{}", path.display());
+                }
+            }
+        }
+    }
 }

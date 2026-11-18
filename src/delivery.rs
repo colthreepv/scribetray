@@ -199,7 +199,11 @@ pub(crate) fn poll_pending_delivery(config: &Config, ui: &UiRuntime, history: &H
         let pending = slot.as_mut()?;
         let now = Instant::now();
         if now >= pending.deadline {
-            info!("pending transcript expired; it stays on the clipboard");
+            info!(
+                expected = ?pending.target.focused_runtime_id,
+                focused = %wininput::describe_focus(),
+                "pending transcript expired; it stays on the clipboard"
+            );
             *slot = None;
             return None;
         }

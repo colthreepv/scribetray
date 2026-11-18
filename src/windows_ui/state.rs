@@ -67,6 +67,7 @@ impl UiState {
             UiCommand::SetSettings(settings) => {
                 let hotkeys_changed = self.settings.toggle_hotkey != settings.toggle_hotkey;
                 let cancel_changed = self.settings.cancel_hotkey != settings.cancel_hotkey;
+                let size_changed = self.settings.anchor_size != settings.anchor_size;
                 let mode_changed = self.settings.push_to_talk != settings.push_to_talk;
                 if settings.provider != crate::config::Provider::Elevenlabs {
                     self.usage = None;
@@ -75,6 +76,14 @@ impl UiState {
                     self.unregister_cancel();
                 }
                 self.settings = *settings;
+                if size_changed {
+                    self.overlay_levels.fill(0.0);
+                    self.overlay_shown.fill(0.0);
+                }
+                if self.overlay_visible {
+                    self.reposition_overlay();
+                    self.render_overlay();
+                }
                 KEYBOARD_HOOK_STATE.with(|state| {
                     if let Some(state) = state.borrow_mut().as_mut() {
                         if hotkeys_changed || mode_changed {

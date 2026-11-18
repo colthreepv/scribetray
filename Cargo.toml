@@ -54,6 +54,9 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }
+
 [build-dependencies]
 winresource = "0.1.31"
 

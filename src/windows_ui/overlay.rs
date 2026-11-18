@@ -23,23 +23,99 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEACTIVATE, WM_NCHITTEST, WS_EX_TRANSPARENT,
 };
 
-/// Caret overlay geometry in device-independent pixels, scaled per monitor.
-pub(super) const PILL_WIDTH_DIP: f32 = 58.0;
-pub(super) const PILL_COUNTDOWN_WIDTH_DIP: f32 = 90.0;
-pub(super) const PILL_HEIGHT_DIP: f32 = 22.0;
-pub(super) const PILL_RADIUS_DIP: f32 = 11.0;
-/// Transparent margin around the pill that carries the soft shadow.
-pub(super) const OVERLAY_SHADOW_PAD_DIP: f32 = 8.0;
-const OVERLAY_GAP_DIP: f32 = 8.0;
-const OVERLAY_CARET_INSET_DIP: f32 = 4.0;
-pub(super) const OVERLAY_WAVE_BARS: usize = 7;
-pub(super) const OVERLAY_BAR_WIDTH_DIP: f32 = 2.0;
-pub(super) const OVERLAY_BAR_PITCH_DIP: f32 = 4.0;
-pub(super) const OVERLAY_BAR_START_DIP: f32 = 21.0;
-pub(super) const OVERLAY_BAR_MIN_DIP: f32 = 2.0;
-pub(super) const OVERLAY_BAR_MAX_DIP: f32 = 14.0;
-pub(super) const OVERLAY_DOT_X_DIP: f32 = 11.0;
-pub(super) const OVERLAY_DOT_RADIUS_DIP: f32 = 3.0;
+/// Maximum waveform storage; geometry selects the active prefix.
+pub(super) const OVERLAY_WAVE_BARS: usize = 13;
+
+/// All size-dependent measurements are in device-independent pixels.
+#[derive(Clone, Copy)]
+pub(super) struct OverlayGeometry {
+    pub width: f32,
+    pub countdown_width: f32,
+    pub height: f32,
+    pub shadow_pad: f32,
+    pub gap: f32,
+    pub caret_inset: f32,
+    pub bars: usize,
+    pub bar_width: f32,
+    pub bar_pitch: f32,
+    pub bar_start: f32,
+    pub bar_min: f32,
+    pub bar_max: f32,
+    pub dot_x: f32,
+    pub dot_radius: f32,
+    pub close_radius: f32,
+    pub close_reach: f32,
+    pub close_stroke: f32,
+    pub error_reach: f32,
+    pub error_stroke: f32,
+    pub work_start: f32,
+    pub work_pitch: f32,
+    pub work_radius: f32,
+    pub work_bounce: f32,
+    pub countdown_font: f32,
+    pub countdown_inset: f32,
+}
+
+impl OverlayGeometry {
+    pub fn for_size(size: crate::config::AnchorSize) -> Self {
+        match size {
+            crate::config::AnchorSize::Normal => Self {
+                width: 58.0,
+                countdown_width: 90.0,
+                height: 22.0,
+                shadow_pad: 8.0,
+                gap: 8.0,
+                caret_inset: 4.0,
+                bars: 7,
+                bar_width: 2.0,
+                bar_pitch: 4.0,
+                bar_start: 21.0,
+                bar_min: 2.0,
+                bar_max: 14.0,
+                dot_x: 11.0,
+                dot_radius: 3.0,
+                close_radius: 8.0,
+                close_reach: 3.0,
+                close_stroke: 1.5,
+                error_reach: 3.5,
+                error_stroke: 2.0,
+                work_start: 27.0,
+                work_pitch: 6.0,
+                work_radius: 1.75,
+                work_bounce: 3.0,
+                countdown_font: 11.0,
+                countdown_inset: 10.0,
+            },
+            crate::config::AnchorSize::Large => Self {
+                width: 100.0,
+                countdown_width: 150.0,
+                height: 32.0,
+                shadow_pad: 8.0,
+                gap: 12.0,
+                caret_inset: 6.0,
+                bars: 13,
+                bar_width: 3.0,
+                bar_pitch: 4.5,
+                bar_start: 30.0,
+                bar_min: 3.0,
+                bar_max: 22.0,
+                dot_x: 16.0,
+                dot_radius: 4.5,
+                close_radius: 12.0,
+                close_reach: 4.5,
+                close_stroke: 2.0,
+                error_reach: 5.0,
+                error_stroke: 2.5,
+                work_start: 45.0,
+                work_pitch: 10.0,
+                work_radius: 2.5,
+                work_bounce: 4.5,
+                countdown_font: 16.0,
+                countdown_inset: 15.0,
+            },
+        }
+    }
+}
 /// Per-frame easing applied to each waveform bar toward its sampled level.
 const OVERLAY_BAR_EASING: f32 = 0.45;
 pub(super) const OVERLAY_FADE_IN_SECONDS: f32 = 0.12;
@@ -57,6 +133,10 @@ thread_local! {
 }
 
 impl UiState {
+    pub(super) fn overlay_geometry(&self) -> OverlayGeometry {
+        OverlayGeometry::for_size(self.settings.anchor_size)
+    }
+
     fn overlay_can_cancel(&self) -> bool {
         self.overlay_visible
             && self.recording
@@ -109,7 +189,7 @@ impl UiState {
                     x: cursor.x - rect.left,
                     y: cursor.y - rect.top,
                 },
-                overlay_close_rect(self.overlay_dpi_scale.max(0.5)),
+                overlay_close_rect(self.overlay_dpi_scale.max(0.5), self.overlay_geometry()),
             );
         // While the button is held, keep capture even if the cursor drifts off.
         if CLOSE_PRESSED.get() && OVERLAY_HOVERED.get() && !hot {
@@ -136,7 +216,10 @@ impl UiState {
                             x: point.x - rect.left,
                             y: point.y - rect.top,
                         },
-                        overlay_close_rect(self.overlay_dpi_scale.max(0.5)),
+                        overlay_close_rect(
+                            self.overlay_dpi_scale.max(0.5),
+                            self.overlay_geometry(),
+                        ),
                     );
                 Some(LRESULT(if on_close {
                     HTCLIENT as isize
@@ -148,7 +231,10 @@ impl UiState {
                 if self.overlay_close_visible()
                     && point_in_rect(
                         message_point(lparam),
-                        overlay_close_rect(self.overlay_dpi_scale.max(0.5)),
+                        overlay_close_rect(
+                            self.overlay_dpi_scale.max(0.5),
+                            self.overlay_geometry(),
+                        ),
                     )
                 {
                     CLOSE_PRESSED.set(true);
@@ -163,7 +249,10 @@ impl UiState {
                     && self.overlay_close_visible()
                     && point_in_rect(
                         message_point(lparam),
-                        overlay_close_rect(self.overlay_dpi_scale.max(0.5)),
+                        overlay_close_rect(
+                            self.overlay_dpi_scale.max(0.5),
+                            self.overlay_geometry(),
+                        ),
                     );
                 unsafe {
                     if GetCapture() == self.overlay_hwnd {
@@ -279,15 +368,15 @@ impl UiState {
         };
         let scale = self.overlay_dpi_scale.max(0.5);
         let expanded = overlay_countdown(self).is_some();
-        let (left, top) = overlay_window_position(rect, scale, expanded);
+        let (left, top) = overlay_window_position(rect, scale, expanded, self.overlay_geometry());
         unsafe {
             let _ = SetWindowPos(
                 self.overlay_hwnd,
                 Some(HWND_TOPMOST),
                 left,
                 top,
-                overlay_window_width(scale, expanded),
-                overlay_window_height(scale),
+                overlay_window_width(scale, expanded, self.overlay_geometry()),
+                overlay_window_height(scale, self.overlay_geometry()),
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
             );
         }
@@ -307,7 +396,7 @@ impl UiState {
             self.refresh_tray();
             return;
         }
-        for index in 0..OVERLAY_WAVE_BARS {
+        for index in 0..self.overlay_geometry().bars {
             let shown = self.overlay_shown[index];
             self.overlay_shown[index] =
                 shown + (self.overlay_levels[index] - shown) * OVERLAY_BAR_EASING;
@@ -325,8 +414,9 @@ impl UiState {
             .as_ref()
             .map(|meter| meter.level())
             .unwrap_or(0.0);
-        self.overlay_levels.rotate_left(1);
-        self.overlay_levels[OVERLAY_WAVE_BARS - 1] = level;
+        let bars = self.overlay_geometry().bars;
+        self.overlay_levels[..bars].rotate_left(1);
+        self.overlay_levels[bars - 1] = level;
     }
 
     /// Rasterizes the current state and presents it as a premultiplied layer.
@@ -335,8 +425,13 @@ impl UiState {
             return;
         }
         let scale = self.overlay_dpi_scale.max(0.5);
-        let width = overlay_window_width(scale, overlay_countdown(self).is_some()).max(1) as u32;
-        let height = overlay_window_height(scale).max(1) as u32;
+        let width = overlay_window_width(
+            scale,
+            overlay_countdown(self).is_some(),
+            self.overlay_geometry(),
+        )
+        .max(1) as u32;
+        let height = overlay_window_height(scale, self.overlay_geometry()).max(1) as u32;
         let Some(mut pixmap) = Pixmap::new(width, height) else {
             return;
         };
@@ -360,15 +455,15 @@ fn point_in_rect(point: POINT, rect: RECT) -> bool {
     point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
 
-pub(super) fn overlay_close_rect(scale: f32) -> RECT {
+pub(super) fn overlay_close_rect(scale: f32, geometry: OverlayGeometry) -> RECT {
     // The whole left cap of the pill, up to where the waveform starts.
-    let left = OVERLAY_SHADOW_PAD_DIP;
-    let top = OVERLAY_SHADOW_PAD_DIP;
+    let left = geometry.shadow_pad;
+    let top = geometry.shadow_pad;
     RECT {
         left: (left * scale).round() as i32,
         top: (top * scale).round() as i32,
-        right: ((left + OVERLAY_BAR_START_DIP) * scale).round() as i32,
-        bottom: ((top + PILL_HEIGHT_DIP) * scale).round() as i32,
+        right: ((left + geometry.bar_start) * scale).round() as i32,
+        bottom: ((top + geometry.height) * scale).round() as i32,
     }
 }
 
@@ -439,32 +534,37 @@ fn caret_work_area(caret: CaretRect) -> Option<RECT> {
     }
 }
 
-pub(super) fn overlay_window_width(scale: f32, expanded: bool) -> i32 {
+pub(super) fn overlay_window_width(scale: f32, expanded: bool, geometry: OverlayGeometry) -> i32 {
     let pill_width = if expanded {
-        PILL_COUNTDOWN_WIDTH_DIP
+        geometry.countdown_width
     } else {
-        PILL_WIDTH_DIP
+        geometry.width
     };
-    ((pill_width + OVERLAY_SHADOW_PAD_DIP * 2.0) * scale)
+    ((pill_width + geometry.shadow_pad * 2.0) * scale)
         .round()
         .max(1.0) as i32
 }
 
-pub(super) fn overlay_window_height(scale: f32) -> i32 {
-    ((PILL_HEIGHT_DIP + OVERLAY_SHADOW_PAD_DIP * 2.0) * scale)
+pub(super) fn overlay_window_height(scale: f32, geometry: OverlayGeometry) -> i32 {
+    ((geometry.height + geometry.shadow_pad * 2.0) * scale)
         .round()
         .max(1.0) as i32
 }
 
 /// Places the pill above the caret, flipping below and clamping into the work
 /// area when the caret sits close to a screen edge.
-fn overlay_window_position(caret: CaretRect, scale: f32, expanded: bool) -> (i32, i32) {
-    let window_width = overlay_window_width(scale, expanded);
-    let window_height = overlay_window_height(scale);
-    let pad = (OVERLAY_SHADOW_PAD_DIP * scale).round() as i32;
-    let gap = (OVERLAY_GAP_DIP * scale).round() as i32;
-    let inset = (OVERLAY_CARET_INSET_DIP * scale).round() as i32;
-    let pill_height = (PILL_HEIGHT_DIP * scale).round() as i32;
+fn overlay_window_position(
+    caret: CaretRect,
+    scale: f32,
+    expanded: bool,
+    geometry: OverlayGeometry,
+) -> (i32, i32) {
+    let window_width = overlay_window_width(scale, expanded, geometry);
+    let window_height = overlay_window_height(scale, geometry);
+    let pad = (geometry.shadow_pad * scale).round() as i32;
+    let gap = (geometry.gap * scale).round() as i32;
+    let inset = (geometry.caret_inset * scale).round() as i32;
+    let pill_height = (geometry.height * scale).round() as i32;
     let caret_bottom = caret.top.saturating_add(caret.height.max(1));
 
     let above = caret
@@ -494,52 +594,58 @@ mod tests {
 
     #[test]
     fn close_hit_target_scales_and_stays_clear_of_waveform() {
-        for scale in [0.5, 1.0, 1.25, 1.5, 2.0, 3.0] {
-            let rect = overlay_close_rect(scale);
-            let center = POINT {
-                x: ((OVERLAY_SHADOW_PAD_DIP + OVERLAY_DOT_X_DIP) * scale).round() as i32,
-                y: ((OVERLAY_SHADOW_PAD_DIP + PILL_HEIGHT_DIP / 2.0) * scale).round() as i32,
-            };
-            assert!(point_in_rect(center, rect));
-            assert!(point_in_rect(
-                POINT {
-                    x: rect.left,
-                    y: rect.top
-                },
-                rect
-            ));
-            assert!(!point_in_rect(
-                POINT {
-                    x: rect.right,
-                    y: center.y
-                },
-                rect
-            ));
-            assert!(!point_in_rect(
-                POINT {
-                    x: center.x,
-                    y: rect.bottom
-                },
-                rect
-            ));
-            assert!(!point_in_rect(
-                POINT {
-                    x: rect.left - 1,
-                    y: center.y
-                },
-                rect
-            ));
-            assert!(!point_in_rect(
-                POINT {
-                    x: center.x,
-                    y: rect.top - 1
-                },
-                rect
-            ));
-            assert!(
-                rect.right
-                    <= ((OVERLAY_SHADOW_PAD_DIP + OVERLAY_BAR_START_DIP) * scale).round() as i32
-            );
+        for size in [
+            crate::config::AnchorSize::Normal,
+            crate::config::AnchorSize::Large,
+        ] {
+            let geometry = OverlayGeometry::for_size(size);
+            for scale in [0.5, 1.0, 1.25, 1.5, 2.0, 3.0] {
+                let rect = overlay_close_rect(scale, geometry);
+                let center = POINT {
+                    x: ((geometry.shadow_pad + geometry.dot_x) * scale).round() as i32,
+                    y: ((geometry.shadow_pad + geometry.height / 2.0) * scale).round() as i32,
+                };
+                assert!(point_in_rect(center, rect));
+                assert!(point_in_rect(
+                    POINT {
+                        x: rect.left,
+                        y: rect.top
+                    },
+                    rect
+                ));
+                assert!(!point_in_rect(
+                    POINT {
+                        x: rect.right,
+                        y: center.y
+                    },
+                    rect
+                ));
+                assert!(!point_in_rect(
+                    POINT {
+                        x: center.x,
+                        y: rect.bottom
+                    },
+                    rect
+                ));
+                assert!(!point_in_rect(
+                    POINT {
+                        x: rect.left - 1,
+                        y: center.y
+                    },
+                    rect
+                ));
+                assert!(!point_in_rect(
+                    POINT {
+                        x: center.x,
+                        y: rect.top - 1
+                    },
+                    rect
+                ));
+                assert!(
+                    rect.right
+                        <= ((geometry.shadow_pad + geometry.bar_start) * scale).round() as i32
+                );
+            }
         }
     }
 
