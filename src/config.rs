@@ -59,7 +59,7 @@ restore_clipboard = true
 max_seconds = 600
 # Approximate batch Scribe credits consumed per recorded hour; tune for your plan.
 scribe_credits_per_hour = 585
-# Leave blank to use the Windows default microphone.
+# Leave blank to use the Windows default microphone; "auto" picks from microphone_priority.
 microphone = ""
 # Sounds: "all", "important" (errors and pending insertion), or "off".
 sounds = "important"
@@ -227,6 +227,22 @@ fn parse_config(contents: &str) -> Result<Config, toml::de::Error> {
 }
 
 impl Config {
+    /// Probe `microphone_priority` at each recording start.
+    pub fn microphone_auto(&self) -> bool {
+        self.microphone
+            .as_deref()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case("auto"))
+            && !self.microphone_priority.is_empty()
+    }
+
+    /// The fixed input device, or `None` for the system default.
+    pub fn fixed_microphone(&self) -> Option<&str> {
+        self.microphone
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("auto"))
+    }
+
     /// Loads settings from disk without creating a missing file.
     pub fn load() -> Result<Self, ConfigError> {
         let path = config_path()?;

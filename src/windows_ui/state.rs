@@ -111,7 +111,12 @@ impl UiState {
                     self.usage = usage;
                 }
             }
-            UiCommand::UpdateHistory(history) => self.settings.history = history,
+            UiCommand::UpdateHistory(history, last_microphone) => {
+                self.settings.history = history;
+                if last_microphone.is_some() {
+                    self.settings.last_microphone = last_microphone;
+                }
+            }
             UiCommand::SetRecording(recording) => {
                 self.set_recording(recording);
                 self.refresh_tray();

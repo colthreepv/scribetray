@@ -132,6 +132,10 @@ pub struct HistoryMenuItem {
 /// Initial UI state and the data used to build tray menus.
 #[derive(Clone, Debug)]
 pub struct UiSettings {
+    /// `microphone_priority` is configured, so the menu offers "Auto".
+    pub microphone_auto_available: bool,
+    /// Device used by the most recent recording, shown next to "Auto".
+    pub last_microphone: Option<String>,
     pub toggle_hotkey: Hotkey,
     pub cancel_hotkey: Hotkey,
     pub push_to_talk: bool,
@@ -176,6 +180,8 @@ impl Default for UiSettings {
             },
             scribe_credits_per_hour: 585,
             selected_microphone: None,
+            microphone_auto_available: false,
+            last_microphone: None,
             microphones: Vec::new(),
             prefix_enabled: true,
             auto_enter: false,
@@ -266,7 +272,7 @@ pub enum UiEvent {
 pub enum UiCommand {
     SetSettings(Box<UiSettings>),
     SetUsage(Option<UsageSnapshot>),
-    UpdateHistory(Vec<HistoryMenuItem>),
+    UpdateHistory(Vec<HistoryMenuItem>, Option<String>),
     SetRecording(bool),
     /// Live input level for the overlay waveform; `None` when not capturing.
     SetLevelMeter(Option<crate::audio::LevelMeter>),

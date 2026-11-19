@@ -83,6 +83,9 @@ pub(crate) fn make_ui_settings(
         label: label.to_owned(),
     })
     .collect();
+    let last_microphone = recordings
+        .iter()
+        .find_map(|recording| recording.metadata.as_ref()?.device.clone());
     let history = recordings
         .into_iter()
         .filter(history_item_visible)
@@ -108,6 +111,8 @@ pub(crate) fn make_ui_settings(
         account: transcription::account_state(config),
         scribe_credits_per_hour: config.scribe_credits_per_hour,
         selected_microphone: config.microphone.clone(),
+        microphone_auto_available: !config.microphone_priority.is_empty(),
+        last_microphone,
         microphones,
         prefix_enabled: config.prefix_enabled,
         auto_enter: config.auto_enter,
@@ -286,8 +291,10 @@ pub(crate) fn save_config(config: &Config, ui: &UiRuntime) {
 pub(crate) fn refresh_history_menu(ui: &UiRuntime, history: &History) {
     match history.list() {
         Ok(recordings) => {
+            let settings = make_ui_settings(&Config::default(), recordings, Vec::new());
             let _ = ui.send(UiCommand::UpdateHistory(
-                make_ui_settings(&Config::default(), recordings, Vec::new()).history,
+                settings.history,
+                settings.last_microphone,
             ));
         }
         Err(error) => warn!("could not refresh history menu: {error}"),

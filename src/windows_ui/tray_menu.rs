@@ -410,11 +410,31 @@ fn build_tray_menu(
     let microphone_menu =
         MenuGuard(unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?);
     let default_mic_id = take_menu_id(&mut next_dynamic_id)?;
+    let auto_selected = settings
+        .selected_microphone
+        .as_deref()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("auto"));
+    if settings.microphone_auto_available {
+        let auto_id = take_menu_id(&mut next_dynamic_id)?;
+        let label = match settings.last_microphone.as_deref() {
+            Some(device) if auto_selected => format!("Auto ({})", truncate_menu_label(device)),
+            _ => "Auto".to_owned(),
+        };
+        append_radio_action(
+            microphone_menu.0,
+            &label,
+            auto_id,
+            auto_selected,
+            Some(UiEvent::MicrophoneSelected(Some("auto".to_owned()))),
+            &mut actions,
+        )?;
+    }
     append_radio_action(
         microphone_menu.0,
         "System default",
         default_mic_id,
-        settings.selected_microphone.is_none(),
+        settings.selected_microphone.is_none()
+            || (auto_selected && !settings.microphone_auto_available),
         Some(UiEvent::MicrophoneSelected(None)),
         &mut actions,
     )?;

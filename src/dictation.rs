@@ -97,36 +97,22 @@ fn open_capture(config: &Config, stream: bool) -> Result<OpenedCapture, AudioErr
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    let (recorder, chunks, probes, raw, device_is_default) = if config
-        .microphone_priority
-        .is_empty()
+    let fixed = config.fixed_microphone();
+    let (recorder, chunks, probes, raw, device_is_default) = if !config.microphone_auto()
         && raw_device.is_none()
     {
         let (recorder, chunks) = if stream {
-            let (recorder, chunks) =
-                AudioRecorder::start_realtime(config.microphone.as_deref(), config.max_seconds)?;
+            let (recorder, chunks) = AudioRecorder::start_realtime(fixed, config.max_seconds)?;
             (recorder, Some(chunks))
         } else {
-            (
-                AudioRecorder::start(config.microphone.as_deref(), config.max_seconds)?,
-                None,
-            )
+            (AudioRecorder::start(fixed, config.max_seconds)?, None)
         };
-        (
-            recorder,
-            chunks,
-            Vec::new(),
-            None,
-            config
-                .microphone
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty()),
-        )
+        (recorder, chunks, Vec::new(), None, fixed.is_none())
     } else {
-        let candidates = if config.microphone_priority.is_empty() {
-            vec![config.microphone.clone().unwrap_or_default()]
-        } else {
+        let candidates = if config.microphone_auto() {
             config.microphone_priority.clone()
+        } else {
+            vec![fixed.unwrap_or_default().to_owned()]
         };
         let capture =
             AudioRecorder::start_prioritized(&candidates, raw_device, config.max_seconds, stream)?;
