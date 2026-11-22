@@ -28,6 +28,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{error, info, warn};
 
 const CARET_REFRESH: Duration = Duration::from_millis(250);
+/// How long after the hotkey a placeholder target may still bind to the real field.
+const TARGET_REBIND_WINDOW: Duration = Duration::from_secs(3);
 
 const OPENAI_STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -836,7 +838,8 @@ pub(crate) fn update_timers(
     if let Some(recording) = active {
         let now = Instant::now();
         if now >= recording.next_caret_refresh {
-            if let Some(caret) = wininput::refresh_caret(&recording.target) {
+            let rebind = recording.started.elapsed() < TARGET_REBIND_WINDOW;
+            if let Some(caret) = wininput::refresh_target(&mut recording.target, rebind) {
                 recording.target.caret = Some(caret);
             }
             recording.next_caret_refresh = now + CARET_REFRESH;

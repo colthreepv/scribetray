@@ -90,6 +90,9 @@ pub struct TargetSnapshot {
     /// UIA identity distinguishes controls hosted by a single HWND (for example,
     /// separate editor fields inside a Chromium window).
     pub focused_runtime_id: Option<Vec<i32>>,
+    /// The focused element accepted text when captured. Chromium can report a
+    /// window-level placeholder while its accessibility tree wakes up.
+    pub editable: bool,
     pub caret: Option<CaretSnapshot>,
 }
 
@@ -298,37 +301,54 @@ pub fn capture_target() -> Result<TargetSnapshot> {
     }
 
     let caret = resolve_caret(gui.as_ref(), focused_element.as_ref());
+    let editable = focused_element
+        .as_ref()
+        .is_some_and(|element| focused_is_editable(element).unwrap_or(false));
 
     Ok(TargetSnapshot {
         foreground,
         focused,
         focused_runtime_id,
+        editable,
         caret,
     })
 }
 
-/// Refreshes the caret only while the original foreground and focused control
-/// are still active. A changed target returns `None` and leaves the saved
-/// anchor at its last known location.
-pub fn refresh_caret(target: &TargetSnapshot) -> Option<CaretSnapshot> {
+/// Refreshes the caret only while the original target is still focused; a
+/// changed target returns `None` and leaves the anchor at its last location.
+/// While `rebind` is set, a placeholder target is replaced by the editable
+/// element that now holds focus in the same window.
+pub fn refresh_target(target: &mut TargetSnapshot, rebind: bool) -> Option<CaretSnapshot> {
     let current = capture_target().ok()?;
-    if !same_input_target(target, &current) {
-        return None;
+    if same_input_target(target, &current) {
+        return current.caret;
     }
-    current.caret
+    if rebind && !target.editable && current.editable && current.foreground == target.foreground {
+        info!(
+            from = ?target.focused_runtime_id,
+            to = ?current.focused_runtime_id,
+            "rebound recording target to the focused field"
+        );
+        let caret = current.caret;
+        *target = current;
+        return caret;
+    }
+    None
 }
 
 fn same_input_target(expected: &TargetSnapshot, current: &TargetSnapshot) -> bool {
     if expected.foreground != current.foreground {
         return false;
     }
+    // A UIA RuntimeId already embeds its hosting HWND; Chromium may move Win32
+    // focus between its top-level and render-widget windows for the same field.
+    if let Some(runtime_id) = expected.focused_runtime_id.as_deref() {
+        return current.focused_runtime_id.as_deref() == Some(runtime_id);
+    }
     if !expected.focused.0.is_null() && expected.focused != current.focused {
         return false;
     }
-    match expected.focused_runtime_id.as_deref() {
-        Some(runtime_id) => current.focused_runtime_id.as_deref() == Some(runtime_id),
-        None => !expected.focused.0.is_null() && expected.focused == current.focused,
-    }
+    !expected.focused.0.is_null() && expected.focused == current.focused
 }
 
 /// Insert text only if the captured focus is still current.
@@ -445,19 +465,15 @@ fn target_is_current_inner(target: &TargetSnapshot) -> bool {
     if current_foreground != target.foreground {
         return false;
     }
-    let current_gui = gui_thread_info(current_foreground).ok();
-    let current_focused = current_gui.as_ref().map(|info| info.hwndFocus);
-    if !target.focused.0.is_null() && current_focused != Some(target.focused) {
-        return false;
-    }
-
-    match target.focused_runtime_id.as_deref() {
-        Some(expected) => focused_uia_element()
+    if let Some(expected) = target.focused_runtime_id.as_deref() {
+        return focused_uia_element()
             .ok()
             .and_then(|element| runtime_id(&element).ok().flatten())
-            .is_some_and(|current| current == expected),
-        None => !target.focused.0.is_null() && current_focused == Some(target.focused),
+            .is_some_and(|current| current == expected);
     }
+    let current_gui = gui_thread_info(current_foreground).ok();
+    let current_focused = current_gui.as_ref().map(|info| info.hwndFocus);
+    !target.focused.0.is_null() && current_focused == Some(target.focused)
 }
 
 struct ComApartment;
@@ -1141,6 +1157,36 @@ impl Drop for GlobalMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(focused: isize, runtime_id: Option<Vec<i32>>) -> TargetSnapshot {
+        TargetSnapshot {
+            foreground: HWND(100 as *mut _),
+            focused: HWND(focused as *mut _),
+            focused_runtime_id: runtime_id,
+            editable: true,
+            caret: None,
+        }
+    }
+
+    #[test]
+    fn runtime_id_identifies_the_field_even_when_win32_focus_moves() {
+        let field = vec![42, 198_690, 4, 6, 1, 66_549];
+        let captured = snapshot(100, Some(field.clone()));
+        assert!(same_input_target(&captured, &snapshot(200, Some(field))));
+        assert!(!same_input_target(
+            &captured,
+            &snapshot(100, Some(vec![42, 198_690, 4, 6, 1, 1]))
+        ));
+        assert!(same_input_target(
+            &snapshot(100, None),
+            &snapshot(100, None)
+        ));
+        assert!(!same_input_target(
+            &snapshot(100, None),
+            &snapshot(200, None)
+        ));
+    }
+
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use windows::Win32::System::Ole::{
